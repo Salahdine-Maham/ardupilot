@@ -31,6 +31,13 @@ extern AP_IOMCU iomcu;
 
 #define SCHED_TASK(func, rate_hz, max_time_micros, prio) SCHED_TASK_CLASS(AP_Vehicle, &vehicle, func, rate_hz, max_time_micros, prio)
 
+#include "AP_HSM/AP_HSM.h"
+
+
+// hsm test 
+static AP_HSM hsm; 
+
+
 /*
   2nd group of parameters
  */
@@ -299,6 +306,33 @@ extern AP_Vehicle& vehicle;
  */
 void AP_Vehicle::setup()
 {
+
+
+
+        // HSM code 
+      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
+        // HSM code 
+      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
+      //hsm.set_uart(hal.serial(0));
+hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
+if (hsm.uart == nullptr) {
+    hal.console->printf("Erreur : Port série hal.serial(1) non disponible\n");
+    return;
+}else{
+    hal.console->printf("On commance l'initiation du HSM \n");
+hsm.uart->begin(115200);
+hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
+hsm.flush_input();
+hsm.uart->printf("off\r\n");
+hsm.uart->printf("on\r\n");
+hal.console->printf("Fini initiation du HSM \n");
+}
+
+
+
+
+
+
     // load the default values of variables listed in var_info[]
     AP_Param::setup_sketch_defaults();
 
@@ -537,10 +571,35 @@ void AP_Vehicle::setup()
 #if AP_IBUS_TELEM_ENABLED
     ibus_telem.init();
 #endif
+
+
+        // HSM code 
+      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
+        // HSM code 
+      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
+      //hsm.set_uart(hal.serial(0));
+hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
+hal.console->printf("On commance l'initiation du HSM \n");
+hsm.uart->begin(115200);
+hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
+hsm.flush_input();
+hsm.uart->printf("on\r\n");
+hal.console->printf("Fini initiation du HSM \n");
+
+
 }
 
 void AP_Vehicle::loop()
 {
+
+  // printf("AP_Vehicle::loop() called\n");
+
+    // run the main loop of the vehicle
+    // this is where the vehicle does most of its work
+    // it is called repeatedly by the HAL
+    // it should not return until the vehicle is done
+    // with its work for this loop iteration
+
 #if AP_SCHEDULER_ENABLED
     scheduler.loop();
     G_Dt = scheduler.get_loop_period_s();
