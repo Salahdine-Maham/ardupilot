@@ -33,9 +33,9 @@ extern AP_IOMCU iomcu;
 
 #include "AP_HSM/AP_HSM.h"
 
-
+extern const AP_HAL::HAL& hal;
 // hsm test 
-static AP_HSM hsm; 
+ AP_HSM hsm ; 
 
 
 /*
@@ -309,24 +309,50 @@ void AP_Vehicle::setup()
 
 
 
-        // HSM code 
+        // HSM code  qui marche bien
       // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
         // HSM code 
       // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
       //hsm.set_uart(hal.serial(0));
-hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
-if (hsm.uart == nullptr) {
-    hal.console->printf("Erreur : Port série hal.serial(1) non disponible\n");
-    return;
-}else{
-    hal.console->printf("On commance l'initiation du HSM \n");
-hsm.uart->begin(115200);
-hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
-hsm.flush_input();
-hsm.uart->printf("off\r\n");
-hsm.uart->printf("on\r\n");
-hal.console->printf("Fini initiation du HSM \n");
+// hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
+// hal.console->printf("On commance l'initiation du HSM \n");
+// hsm.uart->begin(115200);
+// hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
+// //hsm.flush_input();
+// hsm.uart->printf("off\r\n");
+// hal.scheduler->delay(100); // Attendre un peu pour s'assurer que le HSM est prêt
+// hsm.uart->printf("on\r\n");
+// hal.scheduler->delay(100); 
+
+// Attendre une réponse du HSM
+//AP_HAL::UARTDriver* uart_hsm = ; 
+hsm.uart_hsm = hal.serial(1);
+hsm.begin();
+hsm.send_apdu("A 00A4040006010203040500", nullptr, 0);
+
+hsm.send_apdu("A 00200001083030303030303030", nullptr, 0);
+
+hsm.send_apdu("A 00D001002000112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF", nullptr, 0);
+
+char key[64] = {0};
+if (hsm.get_key("A 00B0010020", key, sizeof(key))) {
+    printf("Clé extraite : %s\n", key);
+} else {
+    printf("Erreur lors de la récupération de la clé.\n");
 }
+
+
+
+
+
+
+
+
+
+hal.console->printf("Fini initiation du HSM \n");
+
+
+  
 
 
 
@@ -572,19 +598,6 @@ hal.console->printf("Fini initiation du HSM \n");
     ibus_telem.init();
 #endif
 
-
-        // HSM code 
-      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
-        // HSM code 
-      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
-      //hsm.set_uart(hal.serial(0));
-hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
-hal.console->printf("On commance l'initiation du HSM \n");
-hsm.uart->begin(115200);
-hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
-hsm.flush_input();
-hsm.uart->printf("on\r\n");
-hal.console->printf("Fini initiation du HSM \n");
 
 
 }

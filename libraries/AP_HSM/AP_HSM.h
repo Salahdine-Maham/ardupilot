@@ -13,7 +13,9 @@ class AP_HSM
 
 public:
 
-  // AP_HSM::AP_HSM();
+// AP_HSM(AP_HAL::UARTDriver* uart){
+//     uart_hsm = uart ;
+// }
 
     //  /* Do not allow copies */
     // // CLASS_NO_COPY(AP_HSM);
@@ -21,14 +23,16 @@ public:
     //      return _singleton;
     //  }
 
-    AP_HAL::UARTDriver* uart = nullptr;
-    bool begin();
-    bool select_tlsse();
-    bool verify_pin(const char* pin);
-    bool read_key(uint8_t* out_key, size_t len, uint16_t offset = 0x10);
-    bool send_apdu(const char* apdu, char* response, size_t response_len);
-    void set_uart(AP_HAL::UARTDriver* uart_dev) { uart = uart_dev; } 
+    AP_HAL::UARTDriver*  uart_hsm = nullptr;
+    void  begin();
+   // void select_tlsse();
+    // bool verify_pin(const char* pin);
+    // bool read_key(uint8_t* out_key, size_t len, uint16_t offset = 0x10);
+    void send_apdu(const char* apdu, char* response, size_t response_len);
+   // void set_uart(AP_HAL::UARTDriver* uart_dev) { uart = uart_dev; } 
     void flush_input();
+
+    bool get_key(const char* apdu, char* key, size_t key_size);
 
 protected:
 
@@ -38,6 +42,7 @@ protected:
 private:
 
     static AP_HSM *_singleton;
+  //  AP_HAL::UARTDriver*  uart_hsm ;
     
 };
 
