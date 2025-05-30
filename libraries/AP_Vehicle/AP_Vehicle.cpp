@@ -342,16 +342,16 @@ if (hsm.get_key("A 00B0010020", key_ascii, sizeof(key_ascii))) {
 }
 
 
-uint8_t key_bytes[32];
+hsm.key_bytes[32] = {0};
 
 char* p = strstr( key_ascii, "9000");
 if (p) *p = '\0';  // Coupe le 9000 de fin s'il est présent
 
-if (hsm.hexstr_to_bytes(key_ascii, key_bytes, sizeof(key_bytes))) {
+if (hsm.hexstr_to_bytes(key_ascii, hsm.key_bytes, sizeof(hsm.key_bytes))) {
     printf("Clé convertie :\n");
   
     for (size_t i = 0; i < 32; ++i) {
-        printf("0x%02X", key_bytes[i]);
+        printf("0x%02X", hsm.key_bytes[i]);
         if (i < 31) {
             printf(", ");
         }
@@ -623,6 +623,41 @@ hal.console->printf("Fini initiation du HSM \n");
 
 void AP_Vehicle::loop()
 {
+
+    if (hsm.key_bytes) {
+        printf("Clé convertie :\n");
+      
+        for (size_t i = 0; i < 32; ++i) {
+            printf("0x%02X", hsm.key_bytes[i]);
+            if (i < 31) {
+                printf(", ");
+            }
+            if ((i + 1) % 8 == 0) {
+                printf("\n");
+            }
+        }
+    } else {
+        printf("Erreur de conversion.\n");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   // printf("AP_Vehicle::loop() called\n");
 

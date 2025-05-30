@@ -34,6 +34,7 @@ public:
 
     bool get_key(const char* apdu, char* key, size_t key_size);
     bool hexstr_to_bytes(const char* hexstr, uint8_t* out, size_t out_len);
+    uint8_t key_bytes[32];
 
 protected:
 
