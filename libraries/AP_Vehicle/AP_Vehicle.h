@@ -308,6 +308,11 @@ public:
     virtual bool set_home(const Location& loc, bool lock) WARN_IF_UNUSED { return false; }
 #endif
 
+// ... Deux fonction pour la recuperation de cles HSM 
+// ...
+// static uint8_t hsm_key[32];  // Clé HSM (32 octets)
+// static bool hsm_key_loaded;  // Indicateur de chargement
+
 protected:
 
     virtual void init_ardupilot() = 0;

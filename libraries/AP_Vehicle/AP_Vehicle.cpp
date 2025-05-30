@@ -332,17 +332,36 @@ hsm.send_apdu("A 00A4040006010203040500", nullptr, 0);
 
 hsm.send_apdu("A 00200001083030303030303030", nullptr, 0);
 
-hsm.send_apdu("A 00D001002000112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF", nullptr, 0);
+hsm.send_apdu("A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", nullptr, 0);
 
-char key[64] = {0};
-if (hsm.get_key("A 00B0010020", key, sizeof(key))) {
-    printf("Clé extraite : %s\n", key);
+char key_ascii[64] = {0};
+if (hsm.get_key("A 00B0010020", key_ascii, sizeof(key_ascii))) {
+    printf("Clé extraite : %s\n", key_ascii);
 } else {
     printf("Erreur lors de la récupération de la clé.\n");
 }
 
 
+uint8_t key_bytes[32];
 
+char* p = strstr( key_ascii, "9000");
+if (p) *p = '\0';  // Coupe le 9000 de fin s'il est présent
+
+if (hsm.hexstr_to_bytes(key_ascii, key_bytes, sizeof(key_bytes))) {
+    printf("Clé convertie :\n");
+  
+    for (size_t i = 0; i < 32; ++i) {
+        printf("0x%02X", key_bytes[i]);
+        if (i < 31) {
+            printf(", ");
+        }
+        if ((i + 1) % 8 == 0) {
+            printf("\n");
+        }
+    }
+} else {
+    printf("Erreur de conversion.\n");
+}
 
 
 

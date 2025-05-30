@@ -4,6 +4,12 @@
 #include <AP_SerialManager/AP_SerialManager.h>
 #include <stdio.h>
 
+#include <cctype>
+#include <iostream>
+
+
+
+
 
 extern const AP_HAL::HAL& hal;
 
@@ -171,7 +177,7 @@ void AP_HSM::flush_input() {
         bool response_complete = false;
     
         while ((AP_HAL::millis() - start) < 1000) {
-            while (uart_hsm->available() > 0 && idx < key_size - 1) {
+            while (uart_hsm->available() > 0 && idx < key_size ) {
                 char rep = uart_hsm->read();
                 printf("0x%02X\n", rep);
                 key[idx++] = rep;
@@ -191,7 +197,7 @@ void AP_HSM::flush_input() {
         }
     
         if (idx > 0) {
-            key[idx] = '\0';  // Terminer la chaîne
+         key[idx] = '\0';  // Terminer la chaîne
             printf("<< Réponse brute : %s", key);
     
             // // Nettoyer le \r\n si présent
@@ -210,5 +216,26 @@ void AP_HSM::flush_input() {
 
 
 
+bool AP_HSM::hexstr_to_bytes(const char* hexstr, uint8_t* out, size_t out_len) {
+            size_t len = strlen(hexstr);
+        
+            // Ignore les caractères non-hexadécimaux à la fin (ex: "9000", caractères erronés...)
+            size_t max_hex = out_len * 2;
+            if (len < max_hex) {
+                printf("Chaîne trop courte : %zu < %zu\n", len, max_hex);
+                return false;
+            }
+        
+            for (size_t i = 0; i < out_len; ++i) {
+                char byte_str[3] = { hexstr[i*2], hexstr[i*2 + 1], '\0' };
+                if (!isxdigit(byte_str[0]) || !isxdigit(byte_str[1])) {
+                    printf("Caractère non-hex à la position %zu\n", i * 2);
+                    return false;
+                }
+                sscanf(byte_str, "%2hhx", &out[i]);
+            }
+        
+            return true;
+        }
 
 

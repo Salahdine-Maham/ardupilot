@@ -33,6 +33,7 @@ public:
     void flush_input();
 
     bool get_key(const char* apdu, char* key, size_t key_size);
+    bool hexstr_to_bytes(const char* hexstr, uint8_t* out, size_t out_len);
 
 protected:
 
