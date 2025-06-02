@@ -35,7 +35,13 @@ extern AP_IOMCU iomcu;
 
 extern const AP_HAL::HAL& hal;
 // hsm test 
- AP_HSM hsm ; 
+ //AP_HSM hsm ; 
+
+
+ 
+ 
+
+
 
 
 /*
@@ -326,49 +332,121 @@ void AP_Vehicle::setup()
 
 // Attendre une réponse du HSM
 //AP_HAL::UARTDriver* uart_hsm = ; 
-hsm.uart_hsm = hal.serial(1);
-hsm.begin();
-hsm.send_apdu("A 00A4040006010203040500", nullptr, 0);
-
-hsm.send_apdu("A 00200001083030303030303030", nullptr, 0);
-
-hsm.send_apdu("A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", nullptr, 0);
-
-char key_ascii[64] = {0};
-if (hsm.get_key("A 00B0010020", key_ascii, sizeof(key_ascii))) {
-    printf("Clé extraite : %s\n", key_ascii);
-} else {
-    printf("Erreur lors de la récupération de la clé.\n");
-}
 
 
-hsm.key_bytes[32] = {0};
 
-char* p = strstr( key_ascii, "9000");
-if (p) *p = '\0';  // Coupe le 9000 de fin s'il est présent
 
-if (hsm.hexstr_to_bytes(key_ascii, hsm.key_bytes, sizeof(hsm.key_bytes))) {
-    printf("Clé convertie :\n");
-  
-    for (size_t i = 0; i < 32; ++i) {
-        printf("0x%02X", hsm.key_bytes[i]);
-        if (i < 31) {
-            printf(", ");
-        }
-        if ((i + 1) % 8 == 0) {
-            printf("\n");
-        }
+AP_HAL::UARTDriver* uart = hal.serial(1); // Ajustez selon votre configuration
+    if (uart == nullptr) {
+        hal.console->printf("Erreur : UART non disponible pour HSM\n");
+        return;
     }
+
+// Initialiser le HSM    
+AP_HSM& hsm = AP_HSM::get_singleton(); 
+hsm.begin(uart);
+
+
+
+
+
+//hsm.uart_hsm = hal.serial(1);
+//hsm.begin();
+
+
+// Envoyer l'APDU
+char response[128];
+const char* apdu1 = "A 00A4040006010203040500";
+if (hsm.send_apdu(apdu1, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
 } else {
-    printf("Erreur de conversion.\n");
+    printf("Erreur : Aucune réponse reçue\n");
+}
+
+
+const char* apdu2 = "A 00200001083030303030303030";
+if (hsm.send_apdu(apdu2, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
+} else {
+    printf("Erreur : Aucune réponse reçue\n");
+}
+
+
+const char* apdu3 = "A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+if (hsm.send_apdu(apdu3, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
+} else {
+    printf("Erreur : Aucune réponse reçue\n");
 }
 
 
 
 
+// Récupérer la clé de cryptage
+char key_buffer[128];
+const char* apdu4 = "A 00B0010020"; // Exemple d'APDU
+if (hsm.get_key(apdu4, key_buffer, sizeof(key_buffer))) {
+    printf("Clé récupérée avec succès : %s\n", key_buffer);
+
+    // Accéder à key_bytes
+    const uint8_t* key = hsm.get_key_bytes();
+    size_t key_len = hsm.get_key_bytes_len();
+
+    // Parcourir key_bytes
+    printf("Contenu de key_bytes (hex) : ");
+    for (size_t i = 0; i < key_len; ++i) {
+        printf("%02X ", key[i]);
+    }
+    printf("\n");
+} else {
+    printf("Erreur : Échec de la récupération de la clé\n");
+}
+}
 
 
-hal.console->printf("Fini initiation du HSM \n");
+
+
+// hsm.send_apdu("A 00A4040006010203040500", nullptr, 0);
+
+// hsm.send_apdu("A 00200001083030303030303030", nullptr, 0);
+
+// hsm.send_apdu("A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", nullptr, 0);
+
+// char key_ascii[64] = {0};
+// if (hsm.get_key("A 00B0010020", key_ascii, sizeof(key_ascii))) {
+//     printf("Clé extraite : %s\n", key_ascii);
+// } else {
+//     printf("Erreur lors de la récupération de la clé.\n");
+// }
+
+
+//hsm.get_key_bytes() = {0};
+
+// char* p = strstr( key_ascii, "9000");
+// if (p) *p = '\0';  // Coupe le 9000 de fin s'il est présent
+
+// if (hsm.hexstr_to_bytes(key_ascii, hsm.get_key_bytes, sizeof(hsm.get_key_bytes))) {
+//     printf("Clé convertie :\n");
+  
+//     for (size_t i = 0; i < 32; ++i) {
+//         printf("0x%02X", hsm.get_key_bytes[i]);
+//         if (i < 31) {
+//             printf(", ");
+//         }
+//         if ((i + 1) % 8 == 0) {
+//             printf("\n");
+//         }
+//     }
+// } else {
+//     printf("Erreur de conversion.\n");
+// }
+
+
+
+
+
+
+// hal.console->printf("Fini initiation du HSM \n");
 
 
   
@@ -624,21 +702,21 @@ hal.console->printf("Fini initiation du HSM \n");
 void AP_Vehicle::loop()
 {
 
-    if (hsm.key_bytes) {
-        printf("Clé convertie :\n");
+    // if (hsm.key_bytes) {
+    //     printf("Clé convertie :\n");
       
-        for (size_t i = 0; i < 32; ++i) {
-            printf("0x%02X", hsm.key_bytes[i]);
-            if (i < 31) {
-                printf(", ");
-            }
-            if ((i + 1) % 8 == 0) {
-                printf("\n");
-            }
-        }
-    } else {
-        printf("Erreur de conversion.\n");
-    }
+    //     for (size_t i = 0; i < 32; ++i) {
+    //         printf("0x%02X", hsm.key_bytes[i]);
+    //         if (i < 31) {
+    //             printf(", ");
+    //         }
+    //         if ((i + 1) % 8 == 0) {
+    //             printf("\n");
+    //         }
+    //     }
+    // } else {
+    //     printf("Erreur de conversion.\n");
+    // }
 
 
 
