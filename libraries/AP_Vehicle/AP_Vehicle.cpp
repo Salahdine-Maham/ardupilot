@@ -401,7 +401,7 @@ if (hsm.get_key(apdu4, key_buffer, sizeof(key_buffer))) {
 } else {
     printf("Erreur : Échec de la récupération de la clé\n");
 }
-}
+
 
 
 
