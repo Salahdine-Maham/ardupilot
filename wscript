@@ -293,6 +293,11 @@ submodules at specific revisions.
     g.add_option('--enable-gps-logging', action='store_true',
                  default=False,
                  help="Enables GPS logging")
+    # ajout the options enable-hsm
+    g.add_option('--enable-hsm',
+                 action='store_true',
+                 default=False,
+                 help='Enable HSM encryption')
     
     g.add_option('--enable-dds', action='store_true',
                  help="Enable the dds client to connect with ROS2/DDS.")
@@ -520,6 +525,18 @@ def configure(cfg):
     cfg.env.ENABLE_STATS = cfg.options.enable_stats
     cfg.env.SAVE_TEMPS = cfg.options.save_temps
 
+   #intefgration option enable hsm code 
+   
+    if cfg.options.enable_hsm:
+        cfg.msg('HSM encryption', 'enabled')
+        cfg.define('AP_HSM_ENABLED', 1)
+        cfg.env.append_value('SRC', [
+            'libraries/GCS_MAVLink/chacha20.c'
+        ])
+    else:
+        cfg.msg('HSM encryption', 'disabled', color='YELLOW')
+
+
     extra_hwdef = cfg.options.extra_hwdef
     if extra_hwdef is not None and not os.path.exists(extra_hwdef):
         raise FileNotFoundError(f"extra-hwdef file NOT found: '{cfg.options.extra_hwdef}'")
@@ -545,6 +562,7 @@ def configure(cfg):
         cfg.define('AP_BOARD_START_TIME', cfg.options.board_start_time)
         # also in env for hrt.c
         cfg.env.AP_BOARD_START_TIME = cfg.options.board_start_time
+
 
     # require python 3.8.x or later
     cfg.load('python')
@@ -919,6 +937,10 @@ def build(bld):
         use=['mavlink'],
         cxxflags=['-include', 'ap_config.h'],
     )
+
+    # integration du HSM dans le build
+    if bld.options.enable_hsm:
+        bld.recurse('libraries/AP_HSM')
 
     _load_pre_build(bld)
 

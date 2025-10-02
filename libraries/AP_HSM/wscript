@@ -1,0 +1,9 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_library(
+        name='AP_HSM',
+        sources=['AP_HSM.cpp'],
+        includes=['.']
+    )

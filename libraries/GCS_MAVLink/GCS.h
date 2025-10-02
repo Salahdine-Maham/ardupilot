@@ -227,6 +227,8 @@ public:
 
     // send a mavlink_message_t out this GCS_MAVLINK connection.
     void send_message(uint32_t msgid, const char *pkt) {
+
+       
         const mavlink_msg_entry_t *entry = mavlink_get_msg_entry(msgid);
         if (entry == nullptr) {
             return;
@@ -234,6 +236,10 @@ public:
         send_message(pkt, entry);
     }
     void send_message(const char *pkt, const mavlink_msg_entry_t *entry) {
+
+        // log pour verifier les mesage envoyer 
+        // printf("Sending message ID %u on channel %u\n", entry->msgid, chan);
+
         if (!check_payload_size(entry->max_msg_len)) {
             return;
         }
@@ -478,6 +484,8 @@ public:
     uint16_t get_stream_slowdown_ms() const { return stream_slowdown_ms; }
 
     MAV_RESULT set_message_interval(uint32_t msg_id, int32_t interval_us);
+
+ 
 
 protected:
 
@@ -1301,6 +1309,9 @@ public:
     uint8_t get_available_modes_sequence() const { return available_modes_sequence; }
     void available_modes_changed() { available_modes_sequence += 1; }
 
+    void hex_print(uint8_t* pv,uint16_t s,uint16_t length);
+    uint8_t mav_trim_payload_custum(const char *payload, uint8_t length);
+
 protected:
 
     virtual GCS_MAVLINK *new_gcs_mavlink_backend(AP_HAL::UARTDriver &uart) = 0;
@@ -1319,6 +1330,8 @@ protected:
     AP_Int16                 mav_gcs_sysid;
     AP_Enum16<Option>        mav_options;
     AP_Int8                  mav_telem_delay;
+    AP_Int8                  mav_encrypt; // Nouveau paramètre pour le chiffrement
+
 
 private:
 

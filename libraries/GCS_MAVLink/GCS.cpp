@@ -20,10 +20,26 @@
 #include <AP_GPS/AP_GPS.h>
 #include <RC_Channel/RC_Channel.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_HSM/AP_HSM.h>
 
 #include "MissionItemProtocol_Waypoints.h"
 #include "MissionItemProtocol_Rally.h"
 #include "MissionItemProtocol_Fence.h"
+
+#include "chacha20.h"
+#include "chacha20.c"
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+#include <math.h>
+#include <memory.h>
+#include "rc4.h"
+#include "rc4.c"
+#include <stdio.h>
+
+#ifndef AP_HSM_ENABLED
+#define AP_HSM_ENABLED 0
+#endif
 
 extern const AP_HAL::HAL& hal;
 
@@ -66,6 +82,13 @@ const AP_Param::GroupInfo GCS::var_info[] {
     // @Range: 0 30
     // @Increment: 1
     AP_GROUPINFO("_TELEM_DELAY",    4,      GCS, mav_telem_delay, 0),
+        
+    // @Param: _ENCRYPT
+    // @DisplayName: Enable MAVLink encryption
+    // @Description: Enables encryption of MAVLink packets using HSM
+    // @Values: 0:Disabled, 1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("_ENCRYPT",  5,     GCS,  mav_encrypt,  0),
 
 #if MAVLINK_COMM_NUM_BUFFERS > 0
     // @Group: 1
@@ -180,9 +203,132 @@ void GCS::send_text(MAV_SEVERITY severity, const char *fmt, ...)
     va_end(arg_list);
 }
 
+
+
+void  GCS::hex_print(uint8_t* pv, uint16_t s,uint16_t  length )
+{
+    uint8_t * p = pv;
+    if (NULL == pv)
+        printf("NULL");
+    else
+    {
+        unsigned int i ;
+        for (i=s; i<length;++i)
+    printf("%02x ", p[i]);
+
+
+    }
+printf("\n\n");
+}
+
+
+
+uint8_t  GCS::mav_trim_payload_custum(const char *payload, uint8_t length)
+{
+	while (length > 1 && payload[length-1] == 0) {
+		length--;
+	}
+	return length;
+}
+
+
+
 void GCS::send_to_active_channels(uint32_t msgid, const char *pkt)
 {
     const mavlink_msg_entry_t *entry = mavlink_get_msg_entry(msgid);
+
+    // introdure le cles de HSM pour crypter mon payload messages
+
+    // uint8_t length = entry->max_msg_len;
+    // length = mav_trim_payload_custum(pkt, length);
+
+#if AP_HSM_ENABLED
+
+    uint8_t length = entry->max_msg_len;
+    length = mav_trim_payload_custum(pkt, length);
+
+    printf("-----------------------------\n"); 
+    printf("Original data sent:\n");    
+    hex_print((uint8_t *)pkt, 0, length); 
+
+    uint8_t encrypt[length];
+    memcpy(encrypt, pkt, length); // Copie par défaut (pas de chiffrement)
+
+    AP_HSM& hsm = AP_HSM::get_singleton();
+    uint8_t* key = hsm.get_key_bytes();
+    size_t key_len = hsm.get_key_bytes_len();
+
+    if (key == nullptr || key_len != 32) { // ChaCha20 nécessite une clé de 32 octets
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "HSM: Invalid encryption key");
+        } else {
+            uint8_t nonce[] = {
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+            };
+            ChaCha20XOR(key, 1, nonce, (uint8_t *)pkt, encrypt, length);
+            printf("Encrypted data sent:\n");
+            hex_print(encrypt, 0, length);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "HSM: Payload encrypted with ChaCha20");
+
+            // Vérification du chiffrement par déchiffrement (optionnel pour débogage)
+            uint8_t decrypted[length];
+            ChaCha20XOR(key, 1, nonce, encrypt, decrypted, length);
+            printf("Decrypted data:\n");
+            hex_print(decrypted, 0,length);
+            if (memcmp(decrypted, pkt, length) == 0) {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "HSM: Decryption verified");
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "HSM: Decryption failed");
+            }
+        }
+
+
+
+
+
+
+
+     printf("Encrypted data sent  :\n");
+     hex_print((uint8_t *)encrypt, 0,length);
+
+#endif // AP_HSM_ENABLED
+
+
+
+//the Chacha20 encryption without using HSM to secure the private keys
+
+
+// uint8_t length = entry->max_msg_len ;
+// length = mav_trim_payload_custum(pkt, length);
+
+
+// printf("Original data sent:\n");    
+// hex_print((uint8_t *)pkt, 0,length); 
+
+
+//     uint8_t key[] = {
+//     0x00, 0x01, 0x02, 0x03,
+//     0x04, 0x05, 0x06, 0x07,
+//     0x08, 0x09, 0x0a, 0x0b,
+//     0x0c, 0x0d, 0x0e, 0x0f,
+//     0x10, 0x11, 0x12, 0x13,
+//     0x14, 0x15, 0x16, 0x17,
+//     0x18, 0x19, 0x1a, 0x1b,
+//     0x1c, 0x1d, 0x1e, 0x1f
+//    };
+// uint8_t nonce[] = {
+//       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+//  };
+// //int i;
+// uint8_t encrypt[length];
+
+//  ChaCha20XOR(key, 1, nonce, (uint8_t *)pkt, (uint8_t *)encrypt, length);
+
+// printf("Encrypted data sent  :\n");
+// hex_print((uint8_t *)encrypt, 0,length);
+
+
+
+
     if (entry == nullptr) {
         return;
     }
@@ -199,10 +345,42 @@ void GCS::send_to_active_channels(uint32_t msgid, const char *pkt)
             continue;
         }
 #endif
-        // size checks done by this method:
-        c.send_message(pkt, entry);
+   
+#if AP_HSM_ENABLED
+     // send the encrypted message
+    
+    c.send_message((const char *)encrypt, entry);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Sent message ID %u on channel %u", entry->msgid, i);
+#else
+
+     // size checks done by this method:
+    // encryption with chacha20 without using HSM to secure the private keys
+    //     printf("-----------------------------\n"); 
+    //     printf("Original data sent:\n");    
+    //     hex_print((uint8_t *)pkt, 0, length); 
+    //     printf("-----------------------------\n"); 
+
+   
+    //   c.send_message((const char *)encrypt, entry);
+
+      c.send_message(pkt, entry);
+
+
+
+
+#endif // AP_HSM_ENABLED
+
+
     }
 }
+
+
+
+
+
+
+
+
 
 void GCS::send_named_float(const char *name, float value) const
 {

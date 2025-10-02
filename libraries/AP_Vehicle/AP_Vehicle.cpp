@@ -34,8 +34,10 @@ extern AP_IOMCU iomcu;
 #include "AP_HSM/AP_HSM.h"
 
 extern const AP_HAL::HAL& hal;
-// hsm test 
- AP_HSM hsm ; 
+
+#ifndef AP_HSM_ENABLED
+#define AP_HSM_ENABLED 0
+#endif
 
 
 /*
@@ -309,73 +311,72 @@ void AP_Vehicle::setup()
 
 
 
-        // HSM code  qui marche bien
-      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
-        // HSM code 
-      // Initialiser le UART pour le HSM (remplacez 0 par le port série approprié, ex: SERIAL3)
-      //hsm.set_uart(hal.serial(0));
-// hsm.uart = hal.serial(1); // Assurez-vous que le port série est correctement configuré dans votre matériel
-// hal.console->printf("On commance l'initiation du HSM \n");
-// hsm.uart->begin(115200);
-// hsm.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
-// //hsm.flush_input();
-// hsm.uart->printf("off\r\n");
-// hal.scheduler->delay(100); // Attendre un peu pour s'assurer que le HSM est prêt
-// hsm.uart->printf("on\r\n");
-// hal.scheduler->delay(100); 
+#if AP_HSM_ENABLED
+    // Initialiser le HSM (Hardware Security Module)
 
-// Attendre une réponse du HSM
-//AP_HAL::UARTDriver* uart_hsm = ; 
-hsm.uart_hsm = hal.serial(1);
-hsm.begin();
-hsm.send_apdu("A 00A4040006010203040500", nullptr, 0);
-
-hsm.send_apdu("A 00200001083030303030303030", nullptr, 0);
-
-hsm.send_apdu("A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F", nullptr, 0);
-
-char key_ascii[64] = {0};
-if (hsm.get_key("A 00B0010020", key_ascii, sizeof(key_ascii))) {
-    printf("Clé extraite : %s\n", key_ascii);
-} else {
-    printf("Erreur lors de la récupération de la clé.\n");
-}
-
-
-uint8_t key_bytes[32];
-
-char* p = strstr( key_ascii, "9000");
-if (p) *p = '\0';  // Coupe le 9000 de fin s'il est présent
-
-if (hsm.hexstr_to_bytes(key_ascii, key_bytes, sizeof(key_bytes))) {
-    printf("Clé convertie :\n");
-  
-    for (size_t i = 0; i < 32; ++i) {
-        printf("0x%02X", key_bytes[i]);
-        if (i < 31) {
-            printf(", ");
-        }
-        if ((i + 1) % 8 == 0) {
-            printf("\n");
-        }
+    AP_HAL::UARTDriver* uart = hal.serial(1); // Ajustez selon votre configuration
+    if (uart == nullptr) {
+        hal.console->printf("Erreur : UART non disponible pour HSM\n");
+        return;
     }
+
+// Initialiser le HSM    
+AP_HSM& hsm = AP_HSM::get_singleton(); 
+hsm.begin(uart);
+
+//hsm.uart_hsm = hal.serial(1);
+//hsm.begin();
+
+
+// Envoyer l'APDU
+char response[128];
+const char* apdu1 = "A 00A4040006010203040500";
+if (hsm.send_apdu(apdu1, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
 } else {
-    printf("Erreur de conversion.\n");
+    printf("Erreur : Aucune réponse reçue\n");
+}
+
+
+const char* apdu2 = "A 00200001083030303030303030";
+if (hsm.send_apdu(apdu2, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
+} else {
+    printf("Erreur : Aucune réponse reçue\n");
+}
+
+
+const char* apdu3 = "A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
+if (hsm.send_apdu(apdu3, response, sizeof(response))) {
+    printf("Réponse APDU : %s\n", response);
+} else {
+    printf("Erreur : Aucune réponse reçue\n");
 }
 
 
 
 
+// Récupérer la clé de cryptage
+char key_buffer[128];
+const char* apdu4 = "A 00B0010020"; // Exemple d'APDU
+if (hsm.get_key(apdu4, key_buffer, sizeof(key_buffer))) {
+    printf("Clé récupérée avec succès : %s\n", key_buffer);
 
+    // Accéder à key_bytes
+    uint8_t* key = hsm.get_key_bytes();
+    size_t key_len = hsm.get_key_bytes_len();
 
-hal.console->printf("Fini initiation du HSM \n");
+    // Parcourir key_bytes
+    printf("Contenu de key_bytes (hex) : ");
+    for (size_t i = 0; i < key_len; ++i) {
+        printf("%02X ", key[i]);
+    }
+    printf("\n");
+} else {
+    printf("Erreur : Échec de la récupération de la clé\n");
+}
 
-
-  
-
-
-
-
+#endif
 
 
     // load the default values of variables listed in var_info[]
