@@ -36,7 +36,7 @@ extern AP_IOMCU iomcu;
 extern const AP_HAL::HAL& hal;
 
 #ifndef AP_HSM_ENABLED
-#define AP_HSM_ENABLED 0
+#define AP_HSM_ENABLED 1
 #endif
 
 
