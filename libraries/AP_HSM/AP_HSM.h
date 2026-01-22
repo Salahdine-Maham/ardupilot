@@ -15,6 +15,11 @@ public:
 
     // Initialise la communication UART avec le HSM
     void begin(AP_HAL::UARTDriver* uart_dev);
+
+    // Feature 1: Initialisation fiable et robuste du LeMonolith
+    // Active le SE, sélectionne l'applet CC et vérifie le PIN
+    bool init_monolith();
+
     // Envoie une commande APDU et récupère la réponse
     bool send_apdu(const char* apdu, char* response, size_t response_len);
 

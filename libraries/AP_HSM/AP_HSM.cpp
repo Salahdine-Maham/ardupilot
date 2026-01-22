@@ -48,12 +48,100 @@ void AP_HSM::begin(AP_HAL::UARTDriver* uart_dev) {
     uart_hsm->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
     flush_input();
 
-    uart_hsm->printf("off\r\n");
-    hal.scheduler->delay(100);
-    uart_hsm->printf("on\r\n");
-    hal.scheduler->delay(100);
-
     hal.console->printf("Initialisation du HSM terminée\n");
+}
+
+/**
+ * Feature 1: Initialisation fiable et robuste du LeMonolith
+ *
+ * Cette fonction effectue une séquence d'initialisation complète :
+ * 1. Désactivation puis activation du Secure Element
+ * 2. Sélection de l'applet CC (Crypto Currency) - AID: 010203040601
+ * 3. Vérification du PIN User (par défaut: "00000000")
+ *
+ * @return true si l'initialisation réussit, false en cas d'erreur
+ *
+ * IMPORTANT: Les APDU doivent être préfixées avec "A " pour le firmware ESP32
+ */
+bool AP_HSM::init_monolith() {
+    if (uart_hsm == nullptr) {
+        hal.console->printf("HSM: Erreur - UART non initialisé\n");
+        return false;
+    }
+
+    hal.console->printf("HSM: Démarrage initialisation LeMonolith...\n");
+
+    // Étape 1: Désactivation du Secure Element
+    flush_input();
+    uart_hsm->printf("off\r\n");
+    hal.scheduler->delay(200);
+    flush_input(); // Ignorer réponse "OK"
+
+    hal.console->printf("HSM: SE désactivé\n");
+
+    // Étape 2: Activation du Secure Element
+    // Note: Le firmware sélectionne automatiquement l'applet CC lors du "on"
+    flush_input();
+    uart_hsm->printf("on\r\n");
+    hal.scheduler->delay(1500); // Attendre initialisation ATR complète
+
+    // Lire et analyser la réponse (contient ATR, PTS, etc.)
+    uint32_t start = AP_HAL::millis();
+    bool atr_complete = false;
+    while ((AP_HAL::millis() - start) < 2000 && !atr_complete) {
+        if (uart_hsm->available() > 0) {
+            uart_hsm->read(); // Lire et ignorer les données d'initialisation
+            // Détecter fin de l'ATR (chercher "9000" ou "OK")
+            // Pour simplifier, on attend juste que le buffer se stabilise
+        }
+        hal.scheduler->delay(10);
+    }
+
+    flush_input(); // Vider buffer restant
+    hal.console->printf("HSM: SE activé\n");
+
+    // Étape 3: SELECT Application CC (Crypto Currency)
+    // AID: 010203040601
+    // L'applet est normalement auto-sélectionné par le firmware, mais on le fait explicitement
+    char response[128];
+    const char* apdu_select_cc = "A 00A4040006010203040601";
+
+    if (!send_apdu(apdu_select_cc, response, sizeof(response))) {
+        hal.console->printf("HSM: Erreur - Timeout SELECT applet CC\n");
+        return false;
+    }
+
+    // Vérifier SW 9000 (succès)
+    if (strstr(response, "9000") == nullptr) {
+        hal.console->printf("HSM: Erreur - SELECT CC échoué. Réponse: %s\n", response);
+        return false;
+    }
+
+    hal.console->printf("HSM: Application CC sélectionnée (AID: 010203040601)\n");
+
+    // Étape 4: VERIFY PIN User
+    // PIN par défaut: "00000000" (8 caractères ASCII)
+    // En hex: 3030303030303030
+    const char* apdu_verify_pin = "A 00200001083030303030303030";
+
+    if (!send_apdu(apdu_verify_pin, response, sizeof(response))) {
+        hal.console->printf("HSM: Erreur - Timeout VERIFY PIN\n");
+        return false;
+    }
+
+    if (strstr(response, "9000") == nullptr) {
+        hal.console->printf("HSM: Erreur - VERIFY PIN échoué. Réponse: %s\n", response);
+        hal.console->printf("HSM: Vérifiez que le PIN est bien \"00000000\"\n");
+        return false;
+    }
+
+    hal.console->printf("HSM: PIN User vérifié avec succès\n");
+
+    // Succès complet
+    hal.console->printf("HSM: ✓ Initialisation LeMonolith terminée avec succès\n");
+    hal.console->printf("HSM: Prêt pour opérations READ/WRITE de clés\n");
+
+    return true;
 }
 
 

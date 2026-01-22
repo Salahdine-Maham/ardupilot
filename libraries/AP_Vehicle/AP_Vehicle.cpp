@@ -312,70 +312,41 @@ void AP_Vehicle::setup()
 
 
 #if AP_HSM_ENABLED
-    // Initialiser le HSM (Hardware Security Module)
+    // Feature 1: Initialisation fiable et robuste du LeMonolith HSM
 
-    AP_HAL::UARTDriver* uart = hal.serial(1); // Ajustez selon votre configuration
+    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 pour le HSM
     if (uart == nullptr) {
-        hal.console->printf("Erreur : UART non disponible pour HSM\n");
-        return;
+        hal.console->printf("HSM: Erreur - UART1 non disponible\n");
+    } else {
+        // Obtenir l'instance singleton et initialiser UART
+        AP_HSM& hsm = AP_HSM::get_singleton();
+        hsm.begin(uart);
+
+        // Initialiser le LeMonolith (off/on, SELECT CC, VERIFY PIN)
+        if (hsm.init_monolith()) {
+            hal.console->printf("HSM: Feature 1 validée avec succès!\n");
+
+            // Test optionnel: Lire une clé depuis le HSM
+            char key_buffer[128];
+            const char* apdu_read_key = "A 00B0010020"; // READ BINARY, 32 bytes
+            if (hsm.get_key(apdu_read_key, key_buffer, sizeof(key_buffer))) {
+                uint8_t* key = hsm.get_key_bytes();
+                size_t key_len = hsm.get_key_bytes_len();
+
+                hal.console->printf("HSM: Clé lue avec succès (32 bytes):\n");
+                hal.console->printf("HSM:   ");
+                for (size_t i = 0; i < key_len && i < 32; ++i) {
+                    hal.console->printf("%02X", key[i]);
+                    if ((i + 1) % 16 == 0) {
+                        hal.console->printf("\nHSM:   ");
+                    }
+                }
+                hal.console->printf("\n");
+            }
+        } else {
+            hal.console->printf("HSM: Erreur - Initialisation échouée\n");
+        }
     }
-
-// Initialiser le HSM    
-AP_HSM& hsm = AP_HSM::get_singleton(); 
-hsm.begin(uart);
-
-//hsm.uart_hsm = hal.serial(1);
-//hsm.begin();
-
-
-// Envoyer l'APDU
-char response[128];
-const char* apdu1 = "A 00A4040006010203040500";
-if (hsm.send_apdu(apdu1, response, sizeof(response))) {
-    printf("Réponse APDU : %s\n", response);
-} else {
-    printf("Erreur : Aucune réponse reçue\n");
-}
-
-
-const char* apdu2 = "A 00200001083030303030303030";
-if (hsm.send_apdu(apdu2, response, sizeof(response))) {
-    printf("Réponse APDU : %s\n", response);
-} else {
-    printf("Erreur : Aucune réponse reçue\n");
-}
-
-
-const char* apdu3 = "A 00D0010020000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-if (hsm.send_apdu(apdu3, response, sizeof(response))) {
-    printf("Réponse APDU : %s\n", response);
-} else {
-    printf("Erreur : Aucune réponse reçue\n");
-}
-
-
-
-
-// Récupérer la clé de cryptage
-char key_buffer[128];
-const char* apdu4 = "A 00B0010020"; // Exemple d'APDU
-if (hsm.get_key(apdu4, key_buffer, sizeof(key_buffer))) {
-    printf("Clé récupérée avec succès : %s\n", key_buffer);
-
-    // Accéder à key_bytes
-    uint8_t* key = hsm.get_key_bytes();
-    size_t key_len = hsm.get_key_bytes_len();
-
-    // Parcourir key_bytes
-    printf("Contenu de key_bytes (hex) : ");
-    for (size_t i = 0; i < key_len; ++i) {
-        printf("%02X ", key[i]);
-    }
-    printf("\n");
-} else {
-    printf("Erreur : Échec de la récupération de la clé\n");
-}
-
 #endif
 
 
