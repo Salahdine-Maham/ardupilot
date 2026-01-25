@@ -4,7 +4,7 @@
 def build(bld):
     bld.ap_library(
         name='AP_HSM',
-        sources=['AP_HSM.cpp', 'KeyOrchestrator.cpp', 'KeyExchangeProtocol.cpp'],
+        sources=['AP_HSM.cpp', 'KeyOrchestrator.cpp', 'KeyExchangeProtocol.cpp', 'DualDekEngine.cpp'],
         includes=['.', '../micro-ecc', '../AP_Crypto'],
         use=['micro-ecc', 'AP_Crypto']
     )

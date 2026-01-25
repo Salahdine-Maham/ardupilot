@@ -32,6 +32,9 @@ extern AP_IOMCU iomcu;
 #define SCHED_TASK(func, rate_hz, max_time_micros, prio) SCHED_TASK_CLASS(AP_Vehicle, &vehicle, func, rate_hz, max_time_micros, prio)
 
 #include "AP_HSM/AP_HSM.h"
+#include "AP_HSM/KeyOrchestrator.h"
+#include "AP_HSM/KeyExchangeProtocol.h"
+#include "AP_HSM/DualDekEngine.h"
 
 extern const AP_HAL::HAL& hal;
 
@@ -308,54 +311,67 @@ extern AP_Vehicle& vehicle;
  */
 void AP_Vehicle::setup()
 {
-
-
-
-#if AP_HSM_ENABLED
-    // Feature 1: Initialisation fiable et robuste du LeMonolith HSM
-
-    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 pour le HSM
-    if (uart == nullptr) {
-        hal.console->printf("HSM: Erreur - UART1 non disponible\n");
-    } else {
-        // Obtenir l'instance singleton et initialiser UART
-        AP_HSM& hsm = AP_HSM::get_singleton();
-        hsm.begin(uart);
-
-        // Initialiser le LeMonolith (off/on, SELECT CC, VERIFY PIN)
-        if (hsm.init_monolith()) {
-            hal.console->printf("HSM: Feature 1 validée avec succès!\n");
-
-            // Test optionnel: Lire une clé depuis le HSM
-            char key_buffer[128];
-            const char* apdu_read_key = "A 00B0010020"; // READ BINARY, 32 bytes
-            if (hsm.get_key(apdu_read_key, key_buffer, sizeof(key_buffer))) {
-                uint8_t* key = hsm.get_key_bytes();
-                size_t key_len = hsm.get_key_bytes_len();
-
-                hal.console->printf("HSM: Clé lue avec succès (32 bytes):\n");
-                hal.console->printf("HSM:   ");
-                for (size_t i = 0; i < key_len && i < 32; ++i) {
-                    hal.console->printf("%02X", key[i]);
-                    if ((i + 1) % 16 == 0) {
-                        hal.console->printf("\nHSM:   ");
-                    }
-                }
-                hal.console->printf("\n");
-            }
-        } else {
-            hal.console->printf("HSM: Erreur - Initialisation échouée\n");
-        }
-    }
-#endif
-
-
     // load the default values of variables listed in var_info[]
     AP_Param::setup_sketch_defaults();
 
 #if AP_SERIALMANAGER_ENABLED
     // initialise serial port
     serial_manager.init_console();
+#endif
+
+#if AP_HSM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    // Feature 1: Initialisation BLOQUANTE du LeMonolith HSM (SITL seulement)
+    // En SITL, le scheduler est single-thread donc on doit bloquer ici
+    // Sur Pixhawk, l'init se fait via hsm_update() dans le scheduler (async)
+    hal.console->printf("HSM: === DÉBUT INIT HSM (SITL BLOQUANT) ===\n"); ;
+    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 pour le HSM
+    if (uart == nullptr) {
+        hal.console->printf("HSM: Erreur - UART1 non disponible\n"); ;
+    } else {
+        AP_HSM& hsm = AP_HSM::get_singleton();
+        hsm.begin(uart);
+        hal.console->printf("HSM: Démarrage init bloquante...\n"); ;
+
+        if (hsm.init_monolith()) {
+            hal.console->printf("HSM: ✓ Feature 1 complétée avec succès!\n"); ;
+
+            // Feature 2.1: KeyOrchestrator
+            hal.console->printf("HSM: Feature 2.1 - Initialisation KeyOrchestrator...\n"); ;
+            KeyOrchestrator& ko = KeyOrchestrator::get_singleton();
+            ko.init(&hsm);
+
+            if (ko.init_mission_keys()) {
+                KeyOrchestrator::Stats ko_stats = ko.get_stats();
+                hal.console->printf("HSM: ✓ Feature 2.1 complétée avec succès!\n"); ;
+                hal.console->printf("HSM:   MK chargée: %s\n", ko_stats.mk_loaded ? "OUI" : "NON"); ;
+                hal.console->printf("HSM:   WK chargée: %s\n", ko_stats.wk_loaded ? "OUI" : "NON"); ;
+                hal.console->printf("HSM:   DEK chargée: %s\n", ko_stats.dek_loaded ? "OUI" : "NON"); ;
+
+                // Feature 2.2: KeyExchangeProtocol
+                hal.console->printf("HSM: Feature 2.2 - Initialisation KeyExchangeProtocol...\n"); ;
+                KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+                if (kep != nullptr && kep->init(&ko)) {
+                    hal.console->printf("HSM: ✓ KeyExchangeProtocol initialisé\n"); ;
+
+                    // Feature 3: DualDekEngine
+                    hal.console->printf("HSM: Feature 3 - Initialisation DualDekEngine...\n"); ;
+                    DualDekEngine* dde = DualDekEngine::get_singleton();
+                    if (dde != nullptr && dde->init(&ko, kep)) {
+                        hal.console->printf("HSM: ✓ DualDekEngine initialisé\n"); ;
+                    } else {
+                        hal.console->printf("HSM: ✗ DualDekEngine échec\n"); ;
+                    }
+                } else {
+                    hal.console->printf("HSM: ✗ KeyExchangeProtocol échec\n"); ;
+                }
+            } else {
+                hal.console->printf("HSM: ✗ Feature 2.1 ÉCHEC!\n"); ;
+            }
+        } else {
+            hal.console->printf("HSM: ✗ Feature 1 ÉCHEC!\n"); ;
+        }
+    }
+    hal.console->printf("HSM: === FIN INIT HSM ===\n"); ;
 #endif
 
     DEV_PRINTF("\n\nInit %s"
@@ -596,7 +612,7 @@ void AP_Vehicle::setup()
 void AP_Vehicle::loop()
 {
 
-  // printf("AP_Vehicle::loop() called\n");
+  // hal.console->printf("AP_Vehicle::loop() called\n");
 
     // run the main loop of the vehicle
     // this is where the vehicle does most of its work
@@ -742,6 +758,12 @@ const AP_Scheduler::Task AP_Vehicle::scheduler_tasks[] = {
 #endif
 #if AP_ARMING_ENABLED
     SCHED_TASK(update_arming,          1,     50, 253),
+#endif
+// HSM: Mode différent selon la plateforme
+// - SITL: Init bloquante dans setup() (single thread)
+// - Pixhawk: Init async via scheduler (multi-thread ChibiOS)
+#if AP_HSM_ENABLED && CONFIG_HAL_BOARD != HAL_BOARD_SITL
+    SCHED_TASK(hsm_update,            10,    200, 254),
 #endif
 };
 
@@ -1223,6 +1245,75 @@ void AP_Vehicle::fence_init()
     hal.scheduler->register_io_process(FUNCTOR_BIND_MEMBER(&AP_Vehicle::fence_checks_async, void));
 }
 #endif  // AP_FENCE_ENABLED
+
+#if AP_HSM_ENABLED
+/*
+  HSM async update - called by scheduler at 10Hz
+  Handles:
+  1. HSM init completion (non-blocking)
+  2. KeyOrchestrator init once HSM is ready
+  3. KeyExchangeProtocol init once keys are loaded
+*/
+void AP_Vehicle::hsm_update()
+{
+    AP_HSM& hsm = AP_HSM::get_singleton();
+
+    // Phase 1: Complete HSM init (async)
+    if (!_hsm_init_done) {
+        if (hsm.update_init()) {
+            // update_init returned true = terminé
+            if (hsm.is_init_complete()) {
+                _hsm_init_done = true;
+                hal.console->printf("HSM: ✓ Feature 1 complétée avec succès!\n");
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "HSM: Init complete");
+            } else if (hsm.is_init_failed()) {
+                _hsm_init_done = true;     // Stop trying
+                _hsm_ko_init_done = true;  // Skip KeyOrchestrator too
+                hal.console->printf("HSM: ✗ Feature 1 ÉCHEC!\n");
+                hal.console->printf("HSM: KeyOrchestrator et KEP désactivés (pas de HSM)\n");
+                GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "HSM: Init FAILED - crypto disabled");
+                return;  // Don't continue with KeyOrchestrator
+            }
+        }
+        return;  // Don't proceed until HSM init done
+    }
+
+    // Phase 2: KeyOrchestrator init (once HSM is ready)
+    if (!_hsm_ko_init_done) {
+        hal.console->printf("HSM: Feature 2.1 - Initialisation KeyOrchestrator...\n");
+
+        KeyOrchestrator& ko = KeyOrchestrator::get_singleton();
+        ko.init(&hsm);
+
+        if (ko.init_mission_keys()) {
+            _hsm_ko_init_done = true;
+
+            // Afficher ko_stats
+            KeyOrchestrator::Stats ko_stats = ko.get_stats();
+            hal.console->printf("HSM: ✓ Feature 2.1 complétée avec succès!\n");
+            hal.console->printf("HSM:   MK chargée: %s\n", ko_stats.mk_loaded ? "OUI" : "NON");
+            hal.console->printf("HSM:   WK chargée: %s\n", ko_stats.wk_loaded ? "OUI" : "NON");
+            hal.console->printf("HSM:   DEK chargée: %s\n", ko_stats.dek_loaded ? "OUI" : "NON");
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "HSM: Keys loaded (MK+WK+DEK)");
+
+            // Phase 3: KeyExchangeProtocol init
+            hal.console->printf("HSM: Feature 2.2 - Initialisation KeyExchangeProtocol...\n");
+            KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+            if (kep != nullptr) {
+                kep->init(&ko);
+                hal.console->printf("HSM: ✓ KeyExchangeProtocol initialisé\n");
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "HSM: KEP ready");
+            } else {
+                hal.console->printf("HSM: ✗ KeyExchangeProtocol singleton non disponible\n");
+            }
+        } else {
+            hal.console->printf("HSM: ✗ Feature 2.1 ÉCHEC!\n");
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "HSM: Key init FAILED");
+            _hsm_ko_init_done = true;  // Stop trying
+        }
+    }
+}
+#endif  // AP_HSM_ENABLED
 
 AP_Vehicle *AP_Vehicle::_singleton = nullptr;
 

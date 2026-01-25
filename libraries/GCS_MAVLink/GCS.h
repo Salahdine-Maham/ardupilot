@@ -1186,6 +1186,9 @@ public:
 
     uint8_t sysid_gcs() const { return uint8_t(mav_gcs_sysid); }
 
+    // Feature 4: Public getter for encryption enable status
+    uint8_t get_mav_encrypt() const { return uint8_t(mav_encrypt); }
+
     // last time traffic was seen from my designated GCS.  traffic
     // includes heartbeats and some manual control messages.
     uint32_t sysid_mygcs_last_seen_time_ms() const {

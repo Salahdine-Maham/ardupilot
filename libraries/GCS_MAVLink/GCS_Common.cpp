@@ -78,6 +78,17 @@
 
 #include <stdio.h>
 
+#ifndef AP_HSM_ENABLED
+#define AP_HSM_ENABLED 1
+#endif
+
+#if AP_HSM_ENABLED
+#include <AP_HSM/AP_HSM.h>
+#include <AP_HSM/KeyExchangeProtocol.h>
+#include <AP_HSM/KeyOrchestrator.h>
+#include "chacha20.h"
+#endif
+
 #if AP_RADIO_ENABLED
 #include <AP_Radio/AP_Radio.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
@@ -1860,6 +1871,10 @@ void GCS_MAVLINK::packetReceived(const mavlink_status_t &status,
         // e.g. enforce-sysid says we shouldn't look at this packet
         return;
     }
+
+    // Feature 3: Decryption is now handled in update_receive() for BAD_CRC messages
+    // Messages reaching here have either passed CRC (plaintext) or been decrypted already
+
     handle_message(msg);
 }
 
@@ -1882,9 +1897,10 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
     const uint16_t nbytes = _port->available();
     for (uint16_t i=0; i<nbytes; i++)
     {
-        const uint8_t c = (uint8_t)_port->read();
+        uint8_t c = (uint8_t)_port->read();
+
         const uint32_t protocol_timeout = 4000;
-        
+
         if (alternative.handler &&
             now_ms - alternative.last_mavlink_ms > protocol_timeout) {
             /*
@@ -1919,6 +1935,61 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
             hal.util->persistent_data.last_mavlink_msgid = 0;
 
         }
+#if AP_HSM_ENABLED
+        else if (framing == MAVLINK_FRAMING_BAD_CRC && gcs().get_mav_encrypt() != 0) {
+            // Feature 3: CRC fails because payload was encrypted
+            // Decrypt and process the message anyway
+            KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+
+            // Get peer DEK based on source sysid
+            const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
+
+            if (peer_dek != nullptr && msg.len > 0) {
+                // Nonce déterministe basé sur les champs du message
+                // Utilise seq + sysid + compid + msgid pour synchronisation
+                uint8_t nonce[12];
+                nonce[0] = msg.seq;
+                nonce[1] = msg.sysid;
+                nonce[2] = msg.compid;
+                nonce[3] = (msg.msgid >> 0) & 0xFF;
+                nonce[4] = (msg.msgid >> 8) & 0xFF;
+                nonce[5] = (msg.msgid >> 16) & 0xFF;
+                nonce[6] = chan;  // Channel ID
+                nonce[7] = 0x00;  // Direction: same as TX
+                nonce[8] = 0x00;
+                nonce[9] = 0x00;
+                nonce[10] = 0x00;
+                nonce[11] = 0x00;
+
+                // Décrypter le payload in-place
+                uint8_t decrypted[MAVLINK_MAX_PAYLOAD_LEN];
+                ChaCha20XOR((uint8_t*)peer_dek, 0, nonce, (uint8_t*)msg.payload64, decrypted, msg.len);
+                memcpy((void*)msg.payload64, decrypted, msg.len);
+
+                // Debug périodique
+                static uint32_t rx_decrypt_count = 0;
+                if (++rx_decrypt_count % 50 == 1) {
+                    hal.console->printf("DDE-RX: Decrypted msg %u from sysid=%u (%u bytes)\n",
+                           msg.msgid, msg.sysid, msg.len);
+                }
+
+                // Process the decrypted message
+                hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
+                packetReceived(status, msg);
+                parsed_packet = true;
+                gcs_alternative_active[chan] = false;
+                alternative.last_mavlink_ms = now_ms;
+                hal.util->persistent_data.last_mavlink_msgid = 0;
+            } else {
+                // No peer DEK - cannot decrypt
+                static uint8_t no_dek_warn_count = 0;
+                if (no_dek_warn_count < 5) {
+                    hal.console->printf("DDE-RX: No DEK for sysid=%u, cannot decrypt\n", msg.sysid);
+                    no_dek_warn_count++;
+                }
+            }
+        }
+#endif // AP_HSM_ENABLED
 #if AP_SCRIPTING_ENABLED
         else if (framing == MAVLINK_FRAMING_BAD_CRC) {
             // This may be a valid message that we don't know the crc extra for, pass it to scripting which might
@@ -4217,6 +4288,37 @@ void GCS_MAVLINK::handle_heartbeat(const mavlink_message_t &msg) const
     if (msg.sysid == gcs().sysid_gcs()) {
         gcs().sysid_mygcs_seen(AP_HAL::millis());
     }
+
+#if AP_HSM_ENABLED
+    // Debug: log that we're in handle_heartbeat
+    static bool first_hb = true;
+    if (first_hb) {
+        hal.console->printf("KEP_DEBUG: handle_heartbeat called for sysid=%d\n", msg.sysid);
+        ;
+        first_hb = false;
+    }
+
+    // Notify KeyExchangeProtocol of heartbeat for peer discovery
+    KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+    if (kep != nullptr) {
+        // Log for debugging (first time only per sysid to avoid spam)
+        static uint32_t last_log_sysid = 0;
+        if (msg.sysid != last_log_sysid) {
+            hal.console->printf("KEP: HEARTBEAT from sysid=%d compid=%d\n",
+                   msg.sysid, msg.compid);
+            ;
+            last_log_sysid = msg.sysid;
+        }
+        kep->on_heartbeat_received(msg.sysid, msg.compid);
+    } else {
+        static bool logged_null = false;
+        if (!logged_null) {
+            hal.console->printf("KEP_DEBUG: singleton is NULL!\n");
+            ;
+            logged_null = true;
+        }
+    }
+#endif
 }
 
 /*
@@ -4547,6 +4649,61 @@ void GCS_MAVLINK::handle_message(const mavlink_message_t &msg)
         // message received from Loweheiser mavlink connection
         handle_generator_message(msg);
         break;
+#endif
+
+#if AP_HSM_ENABLED
+    // HSM Key Exchange Protocol messages
+    case MAVLINK_MSG_ID_HSM_WK_EXCHANGE:
+    {
+        hal.console->printf("KEP: >>> Received HSM_WK_EXCHANGE from sysid=%d\n", msg.sysid);
+        ;
+        KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+        if (kep != nullptr) {
+            mavlink_hsm_wk_exchange_t packet;
+            mavlink_msg_hsm_wk_exchange_decode(&msg, &packet);
+            hal.console->printf("KEP: WK received: %02X%02X%02X%02X...\n",
+                   packet.wk_public[0], packet.wk_public[1],
+                   packet.wk_public[2], packet.wk_public[3]);
+            ;
+            kep->handle_wk_exchange(msg.sysid, msg.compid,
+                                    packet.wk_public, packet.timestamp);
+        } else {
+            hal.console->printf("KEP: ERROR - singleton is NULL!\n");
+            ;
+        }
+        break;
+    }
+
+    case MAVLINK_MSG_ID_HSM_DEK_EXCHANGE:
+    {
+        hal.console->printf("KEP: >>> Received HSM_DEK_EXCHANGE from sysid=%d\n", msg.sysid);
+        ;
+        KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+        if (kep != nullptr) {
+            mavlink_hsm_dek_exchange_t packet;
+            mavlink_msg_hsm_dek_exchange_decode(&msg, &packet);
+            kep->handle_dek_exchange(msg.sysid, msg.compid,
+                                     packet.ephemeral_pubkey,
+                                     packet.encrypted_dek,
+                                     packet.nonce,
+                                     packet.auth_tag);
+        }
+        break;
+    }
+
+    case MAVLINK_MSG_ID_HSM_KEY_ACK:
+    {
+        hal.console->printf("KEP: >>> Received HSM_KEY_ACK from sysid=%d\n", msg.sysid);
+        ;
+        KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+        if (kep != nullptr) {
+            mavlink_hsm_key_ack_t packet;
+            mavlink_msg_hsm_key_ack_decode(&msg, &packet);
+            kep->handle_key_ack(msg.sysid, msg.compid,
+                               packet.status, packet.phase);
+        }
+        break;
+    }
 #endif
     }
 
