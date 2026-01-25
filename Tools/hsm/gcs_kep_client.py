@@ -21,6 +21,14 @@ import struct
 import argparse
 from threading import Thread
 
+# ChaCha20 for payload decryption (Feature 3)
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+    CHACHA20_AVAILABLE = True
+except ImportError:
+    CHACHA20_AVAILABLE = False
+    print("WARNING: cryptography not available for ChaCha20 decryption")
+
 # Add current directory to path for imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -52,6 +60,11 @@ else:
 # Try to import pymavlink for connection handling
 try:
     from pymavlink import mavutil
+    # IMPORTANT: Replace mavutil's mavlink module with our HSM dialect
+    # This makes recv_match() parse HSM messages correctly
+    if MAVLINK_HSM_AVAILABLE:
+        mavutil.mavlink = mavlink_hsm
+        print("[INFO] Replaced mavutil.mavlink with HSM dialect for parsing")
     PYMAVLINK_AVAILABLE = True
 except ImportError:
     PYMAVLINK_AVAILABLE = False
@@ -62,6 +75,94 @@ def log(msg: str, level: str = "INFO"):
     """Log with timestamp"""
     timestamp = time.strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {msg}", flush=True)
+
+
+def chacha20_decrypt(key: bytes, nonce_12: bytes, ciphertext: bytes, counter: int = 0) -> bytes:
+    """
+    Decrypt using ChaCha20 with 12-byte nonce (RFC 7539 style)
+
+    Args:
+        key: 32-byte encryption key
+        nonce_12: 12-byte nonce
+        ciphertext: Encrypted data
+        counter: Block counter (default 0)
+
+    Returns:
+        Decrypted plaintext
+    """
+    if not CHACHA20_AVAILABLE:
+        return None
+
+    # cryptography library wants: counter(4 bytes LE) + nonce(12 bytes) = 16 bytes
+    nonce_16 = counter.to_bytes(4, 'little') + nonce_12
+
+    cipher = Cipher(algorithms.ChaCha20(key, nonce_16), mode=None)
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext)
+
+
+def parse_mavlink_message(raw_bytes: bytes) -> dict:
+    """
+    Parse a MAVLink v2 message from raw bytes
+
+    Returns dict with: stx, len, seq, sysid, compid, msgid, payload, crc
+    """
+    if len(raw_bytes) < 12 or raw_bytes[0] != 0xFD:
+        return None
+
+    result = {
+        'stx': raw_bytes[0],
+        'len': raw_bytes[1],
+        'incompat': raw_bytes[2],
+        'compat': raw_bytes[3],
+        'seq': raw_bytes[4],
+        'sysid': raw_bytes[5],
+        'compid': raw_bytes[6],
+        'msgid': raw_bytes[7] | (raw_bytes[8] << 8) | (raw_bytes[9] << 16),
+        'payload': raw_bytes[10:10+raw_bytes[1]] if len(raw_bytes) >= 10+raw_bytes[1] else b'',
+        'crc': raw_bytes[10+raw_bytes[1]:12+raw_bytes[1]] if len(raw_bytes) >= 12+raw_bytes[1] else b'',
+    }
+    return result
+
+
+def build_nonce_12(seq: int, sysid: int, compid: int, msgid: int, chan: int = 0, direction: int = 0) -> bytes:
+    """
+    Build 12-byte deterministic nonce for ChaCha20 (matches C++ implementation)
+
+    Format: seq(1) + sysid(1) + compid(1) + msgid(3) + chan(1) + dir(1) + padding(4)
+    """
+    nonce = bytes([
+        seq & 0xFF,
+        sysid & 0xFF,
+        compid & 0xFF,
+        (msgid >> 0) & 0xFF,
+        (msgid >> 8) & 0xFF,
+        (msgid >> 16) & 0xFF,
+        chan & 0xFF,
+        direction & 0xFF,  # TX=0, RX=1
+        0x00, 0x00, 0x00, 0x00
+    ])
+    return nonce
+
+
+# MAVLink message names (subset for display)
+MAVLINK_MSG_NAMES = {
+    0: "HEARTBEAT",
+    1: "SYS_STATUS",
+    24: "GPS_RAW_INT",
+    30: "ATTITUDE",
+    33: "GLOBAL_POSITION_INT",
+    35: "RC_CHANNELS_RAW",
+    65: "RC_CHANNELS",
+    74: "VFR_HUD",
+    76: "COMMAND_LONG",
+    77: "COMMAND_ACK",
+    147: "BATTERY_STATUS",
+    253: "STATUSTEXT",
+    12000: "HSM_WK_EXCHANGE",
+    12001: "HSM_DEK_EXCHANGE",
+    12002: "HSM_KEY_ACK",
+}
 
 
 class MockHSM:
@@ -104,7 +205,7 @@ class GCSKeyExchangeClient:
     """
 
     def __init__(self, mavlink_connection: str, hsm_port: str = '/dev/ttyUSB0',
-                 gcs_sysid: int = 255, gcs_compid: int = 190):
+                 gcs_sysid: int = 255, gcs_compid: int = 190, verbose: bool = False):
         """
         Initialize GCS KEP Client
 
@@ -113,11 +214,13 @@ class GCSKeyExchangeClient:
             hsm_port: HSM serial port
             gcs_sysid: GCS system ID (default 255)
             gcs_compid: GCS component ID (default 190 = MAV_COMP_ID_MISSIONPLANNER)
+            verbose: Enable verbose logging of encrypted/decrypted payloads
         """
         self.mavlink_connection_str = mavlink_connection
         self.hsm_port = hsm_port
         self.gcs_sysid = gcs_sysid
         self.gcs_compid = gcs_compid
+        self.verbose = verbose
 
         self.mav = None
         self.hsm = None
@@ -126,6 +229,13 @@ class GCSKeyExchangeClient:
 
         self.running = False
         self.exchange_complete = False
+
+        # Statistics for encrypted message handling
+        self._crypto_stats = {
+            'encrypted_received': 0,
+            'decrypted_ok': 0,
+            'decrypted_fail': 0,
+        }
 
     def _log(self, msg: str, level: str = "INFO"):
         log(msg, level)
@@ -383,10 +493,10 @@ class GCSKeyExchangeClient:
                 self.kep.handle_dek_exchange(
                     msg.get_srcSystem(),
                     msg.get_srcComponent(),
-                    bytes(msg.ephemeral_pub),
+                    bytes(msg.ephemeral_pubkey),
                     bytes(msg.encrypted_dek),
                     bytes(msg.nonce),
-                    bytes(msg.tag)
+                    bytes(msg.auth_tag)
                 )
 
                 # Check if exchange complete
@@ -417,8 +527,10 @@ class GCSKeyExchangeClient:
 
         # Handle unknown message IDs (might be HSM messages not parsed by default)
         elif msg_type == 'BAD_DATA':
-            # Try to parse as HSM message
+            # Try to parse as HSM message first
             self._parse_raw_hsm_message(msg)
+            # Then try to decrypt as encrypted MAVLink message
+            self._try_decrypt_message(msg)
 
     def _handle_unknown_hsm_message(self, msg, msg_id: int):
         """Handle UNKNOWN_* messages which are our custom HSM messages"""
@@ -452,6 +564,8 @@ class GCSKeyExchangeClient:
 
             if msg_id == MAVLINK_MSG_ID_HSM_WK_EXCHANGE:  # 12000
                 self._log(f">>> Received UNKNOWN_12000 (HSM_WK_EXCHANGE) from sysid={src_sysid}")
+                self._log(f"    [DEBUG] payload_len={len(payload)}, first 20 bytes: {payload[:20].hex() if len(payload)>=20 else payload.hex()}")
+                self._log(f"    [DEBUG] self.kep={self.kep is not None}")
                 # MAVLink reorders: timestamp(4) + target_sys(1) + target_comp(1) + wk_public(64) = 70 bytes
                 if len(payload) >= 70 and self.kep:
                     try:
@@ -463,6 +577,8 @@ class GCSKeyExchangeClient:
                         self.kep.handle_wk_exchange(src_sysid, src_compid, wk_public, timestamp)
                     except Exception as e:
                         self._log(f"    ERROR parsing WK: {e}", "ERROR")
+                else:
+                    self._log(f"    [WARN] Cannot parse WK: payload_len={len(payload)}, kep={self.kep is not None}", "WARN")
 
             elif msg_id == MAVLINK_MSG_ID_HSM_DEK_EXCHANGE:  # 12001
                 self._log(f">>> Received UNKNOWN_12001 (HSM_DEK_EXCHANGE) from sysid={src_sysid}")
@@ -551,6 +667,161 @@ class GCSKeyExchangeClient:
         except Exception as e:
             pass  # Ignore parse errors for non-HSM messages
 
+    def _try_decrypt_message(self, msg):
+        """
+        Try to decrypt an encrypted MAVLink message (BAD_DATA due to encrypted payload)
+
+        The drone encrypts only the PAYLOAD portion using ChaCha20 with a deterministic nonce.
+        This causes CRC check to fail (BAD_DATA) since CRC is computed on encrypted bytes.
+
+        We:
+        1. Extract the raw MAVLink frame
+        2. Reconstruct the nonce from header fields
+        3. Decrypt payload using peer's DEK
+        4. Display comparison: encrypted vs decrypted
+        """
+        if not self.exchange_complete:
+            return  # Don't try to decrypt before key exchange
+
+        if not CHACHA20_AVAILABLE:
+            return
+
+        # Get raw buffer
+        raw = None
+        for attr in ['_msgbuf', 'msgbuf', '_payload', 'payload']:
+            if hasattr(msg, attr):
+                data = getattr(msg, attr)
+                if data is not None:
+                    raw = bytes(data)
+                    break
+
+        if raw is None or len(raw) < 12:
+            return
+
+        # Must be MAVLink v2
+        if raw[0] != 0xFD:
+            return
+
+        # Parse header
+        parsed = parse_mavlink_message(raw)
+        if parsed is None:
+            return
+
+        payload_len = parsed['len']
+        src_sysid = parsed['sysid']
+        src_compid = parsed['compid']
+        msgid = parsed['msgid']
+        seq = parsed['seq']
+        encrypted_payload = parsed['payload']
+
+        # Skip plaintext messages (HEARTBEAT, HSM_*)
+        if msgid in {0, 12000, 12001, 12002}:
+            return
+
+        # Get peer's DEK
+        peer_dek = None
+        if self.hsm and hasattr(self.hsm, '_peer_deks'):
+            peer_dek = self.hsm._peer_deks.get(src_sysid)
+
+        if peer_dek is None:
+            return  # No DEK for this peer
+
+        self._crypto_stats['encrypted_received'] += 1
+
+        # Reconstruct nonce (must match C++ GCS_MAVLink.cpp)
+        # nonce = seq(1) + sysid(1) + compid(1) + msgid(3) + chan(1) + dir(1) + padding(4)
+        # Note: chan=0 for TCP, dir=0 for TX (drone's perspective)
+        nonce = build_nonce_12(seq, src_sysid, src_compid, msgid, chan=0, direction=0)
+
+        # Decrypt
+        try:
+            decrypted_payload = chacha20_decrypt(peer_dek, nonce, encrypted_payload, counter=0)
+
+            if decrypted_payload is None:
+                self._crypto_stats['decrypted_fail'] += 1
+                return
+
+            self._crypto_stats['decrypted_ok'] += 1
+
+            # Get message name
+            msg_name = MAVLINK_MSG_NAMES.get(msgid, f"MSG_{msgid}")
+
+            # Log the encrypted vs decrypted comparison
+            if self.verbose:
+                self._log("=" * 60)
+                self._log(f"[CRYPTO] Decrypted message from sysid={src_sysid}")
+                self._log(f"  Message: {msg_name} (ID={msgid})")
+                self._log(f"  Seq: {seq}")
+                self._log(f"  Nonce: {nonce.hex()}")
+                self._log(f"  Encrypted ({len(encrypted_payload)} bytes): {encrypted_payload[:16].hex()}...")
+                self._log(f"  Decrypted ({len(decrypted_payload)} bytes): {decrypted_payload[:16].hex()}...")
+
+                # Try to interpret the decrypted payload based on message type
+                self._interpret_decrypted_payload(msgid, decrypted_payload)
+
+                self._log("=" * 60)
+            else:
+                # Compact log
+                if self._crypto_stats['decrypted_ok'] % 20 == 1:
+                    self._log(f"[CRYPTO] Decrypted: {msg_name} seq={seq} ({self._crypto_stats['decrypted_ok']} total)")
+
+        except Exception as e:
+            self._crypto_stats['decrypted_fail'] += 1
+            if self.verbose:
+                self._log(f"[CRYPTO] Decrypt failed: {e}", "ERROR")
+
+    def _interpret_decrypted_payload(self, msgid: int, payload: bytes):
+        """Interpret the decrypted payload based on message type"""
+        try:
+            if msgid == 30:  # ATTITUDE
+                if len(payload) >= 28:
+                    time_boot_ms = struct.unpack('<I', payload[0:4])[0]
+                    roll = struct.unpack('<f', payload[4:8])[0]
+                    pitch = struct.unpack('<f', payload[8:12])[0]
+                    yaw = struct.unpack('<f', payload[12:16])[0]
+                    self._log(f"    → ATTITUDE: roll={roll:.2f} pitch={pitch:.2f} yaw={yaw:.2f}")
+
+            elif msgid == 33:  # GLOBAL_POSITION_INT
+                if len(payload) >= 28:
+                    time_boot_ms = struct.unpack('<I', payload[0:4])[0]
+                    lat = struct.unpack('<i', payload[4:8])[0] / 1e7
+                    lon = struct.unpack('<i', payload[8:12])[0] / 1e7
+                    alt = struct.unpack('<i', payload[12:16])[0] / 1000.0
+                    relative_alt = struct.unpack('<i', payload[16:20])[0] / 1000.0
+                    self._log(f"    → POSITION: lat={lat:.6f} lon={lon:.6f} alt={alt:.1f}m rel_alt={relative_alt:.1f}m")
+
+            elif msgid == 1:  # SYS_STATUS
+                if len(payload) >= 31:
+                    voltage = struct.unpack('<H', payload[14:16])[0] / 1000.0
+                    current = struct.unpack('<h', payload[16:18])[0] / 100.0
+                    battery = payload[30]
+                    self._log(f"    → SYS_STATUS: voltage={voltage:.2f}V current={current:.1f}A battery={battery}%")
+
+            elif msgid == 74:  # VFR_HUD
+                if len(payload) >= 20:
+                    airspeed = struct.unpack('<f', payload[0:4])[0]
+                    groundspeed = struct.unpack('<f', payload[4:8])[0]
+                    alt = struct.unpack('<f', payload[8:12])[0]
+                    climb = struct.unpack('<f', payload[12:16])[0]
+                    heading = struct.unpack('<h', payload[16:18])[0]
+                    self._log(f"    → VFR_HUD: airspeed={airspeed:.1f} groundspeed={groundspeed:.1f} alt={alt:.1f}m heading={heading}")
+
+            elif msgid == 77:  # COMMAND_ACK
+                if len(payload) >= 3:
+                    command = struct.unpack('<H', payload[0:2])[0]
+                    result = payload[2]
+                    result_names = {0: "ACCEPTED", 1: "TEMPORARILY_REJECTED", 2: "DENIED", 3: "UNSUPPORTED", 4: "FAILED"}
+                    self._log(f"    → COMMAND_ACK: cmd={command} result={result_names.get(result, result)}")
+
+            elif msgid == 253:  # STATUSTEXT
+                if len(payload) >= 2:
+                    severity = payload[0]
+                    text = payload[1:51].rstrip(b'\x00').decode('utf-8', errors='replace')
+                    self._log(f"    → STATUSTEXT: [{severity}] {text}")
+
+        except Exception as e:
+            self._log(f"    → (parse error: {e})")
+
     def run(self, timeout: float = 60.0, trigger_hsm_init: bool = True):
         """Run the key exchange client
 
@@ -589,10 +860,11 @@ class GCSKeyExchangeClient:
                 if msg:
                     self.handle_message(msg)
 
-                # Check if exchange complete
-                if self.exchange_complete:
+                # Check if exchange complete (continue listening for encrypted messages)
+                if self.exchange_complete and not hasattr(self, '_post_exchange_logged'):
                     self._log("Exchange completed successfully!")
-                    break
+                    self._log("Continuing to listen for encrypted messages...")
+                    self._post_exchange_logged = True
 
                 # Check for timeouts
                 if self.kep:
@@ -636,6 +908,13 @@ class GCSKeyExchangeClient:
             self._log("DualDekEngine Status:")
             self.dde.print_status()
 
+        # Crypto stats
+        self._log("")
+        self._log("Crypto Statistics:")
+        self._log(f"  Encrypted received: {self._crypto_stats['encrypted_received']}")
+        self._log(f"  Decrypted OK: {self._crypto_stats['decrypted_ok']}")
+        self._log(f"  Decrypted FAIL: {self._crypto_stats['decrypted_fail']}")
+
     def stop(self):
         """Stop the client"""
         self.running = False
@@ -661,6 +940,8 @@ def main():
                        help='Run without physical HSM (keys in memory)')
     parser.add_argument('--no-trigger', action='store_true',
                        help='Skip SITL HSM init trigger (use when HSM already initialized)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Verbose logging of encrypted/decrypted payloads')
 
     args = parser.parse_args()
 
@@ -674,6 +955,7 @@ def main():
     print(f"  MAVLink: {args.mavlink}")
     print(f"  HSM Port: {args.hsm}")
     print(f"  GCS ID: sysid={args.sysid} compid={args.compid}")
+    print(f"  Verbose: {args.verbose}")
     print("=" * 60)
     print()
 
@@ -681,7 +963,8 @@ def main():
         mavlink_connection=args.mavlink,
         hsm_port=args.hsm,
         gcs_sysid=args.sysid,
-        gcs_compid=args.compid
+        gcs_compid=args.compid,
+        verbose=args.verbose
     )
 
     # Override init_hsm with command line options
