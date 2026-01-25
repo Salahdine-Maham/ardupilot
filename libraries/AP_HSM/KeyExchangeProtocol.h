@@ -26,7 +26,7 @@ class GCS_MAVLINK;
 // Key sizes
 #define KEP_KEY_SIZE        32
 #define KEP_PUBKEY_SIZE     64   // P-256 uncompressed X||Y
-#define KEP_NONCE_SIZE      12
+#define KEP_NONCE_SIZE      24   // XChaCha20-Poly1305 uses 24-byte nonce
 #define KEP_TAG_SIZE        16
 
 // Maximum number of peers
@@ -77,10 +77,18 @@ public:
         bool active;
     };
 
+    // Singleton access (lazy initialization)
+    static KeyExchangeProtocol* get_singleton() {
+        if (_singleton == nullptr) {
+            _singleton = new KeyExchangeProtocol();
+        }
+        return _singleton;
+    }
+
+private:
     KeyExchangeProtocol();
 
-    // Singleton access
-    static KeyExchangeProtocol* get_singleton() { return _singleton; }
+public:
 
     // Initialization
     bool init(KeyOrchestrator* key_orch);
