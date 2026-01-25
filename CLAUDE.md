@@ -7,6 +7,37 @@ HSM LeMonolith v0.6 integration with ArduPilot for secure MAVLink communications
 
 ---
 
+## Quick Start (Pour reprendre le travail)
+
+```bash
+# 1. Vérifier HSM connecté
+ls -la /dev/ttyUSB0
+
+# 2. Compiler
+cd /home/samwitwity/Code_Sources/ardupilot_claude
+./waf configure --board sitl && ./waf copter
+
+# 3. Test rapide Feature 3
+stdbuf -oL ./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200 &
+sleep 3
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 60
+
+# Résultat attendu: "KEY EXCHANGE COMPLETE!"
+```
+
+---
+
+## Commit History
+
+| Commit | Feature | Description |
+|--------|---------|-------------|
+| `2d7b310a78` | Feature 3 | DualDekEngine - Chiffrement MAVLink End-to-End |
+| `46575f08f9` | Feature 2.2 | Key Exchange Protocol - Implementation |
+| `49cb78d04b` | Feature 1 | Organisation et documentation complète |
+| `197a9cec4b` | Feature 1 | Initialisation fiable et robuste du LeMonolith HSM |
+
+---
+
 ## Feature Status (2026-01-25)
 
 | Feature | Status | Notes |
@@ -464,6 +495,41 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 # - "KEY EXCHANGE COMPLETE!"
 # - DDE initialized with peer DEK
 # - BAD_DATA messages = encrypted messages (normal)
+```
+
+---
+
+## Known Issues & Limitations
+
+| Issue | Description | Workaround |
+|-------|-------------|------------|
+| SITL blocking | HSM init bloque TCP pendant ~25s | GCS client attend 60s pour heartbeat |
+| No MAC on payload | ChaCha20 stream cipher sans authentification | CRC MAVLink sert de checksum (pas crypto) |
+| Single connection SITL | SITL s'arrête si connexion TCP fermée | Garder connexion ouverte ou reconnecter |
+| BAD_DATA spam | Messages chiffrés = BAD_CRC côté GCS Python | Filtrer avec `grep -v BAD_DATA` |
+
+---
+
+## Next Steps (Future Work)
+
+| Priority | Task | Description |
+|----------|------|-------------|
+| 1 | Pixhawk hardware test | Tester avec câble TELEM2 → HSM |
+| 2 | RX decrypt Python | Décrypter messages chiffrés dans gcs_kep_client.py |
+| 3 | Multi-drone | Tester avec 2+ drones mesh |
+| 4 | DEK rotation | Rotation de clés en vol |
+| 5 | HSM backup | Sauvegarde/restauration des clés |
+
+---
+
+## Environment
+
+```
+OS: Ubuntu 22.04 (Linux 6.14.0)
+Python: 3.10+
+ArduPilot: V4.7.0-dev
+HSM: LeMonolith v0.6 sur ESP32 (/dev/ttyUSB0)
+Branch: kek-HSM
 ```
 
 ---
