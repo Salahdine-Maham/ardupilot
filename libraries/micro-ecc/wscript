@@ -1,0 +1,12 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    bld.ap_library(
+        name='micro-ecc',
+        sources=['uECC.c'],
+        includes=['.'],
+        export_includes=['libraries/micro-ecc'],  # Chemin depuis la racine du build
+        # Configuration via uECC_config.h (voir fichier header)
+        cflags=['-O3']  # Optimisation pour performance crypto
+    )

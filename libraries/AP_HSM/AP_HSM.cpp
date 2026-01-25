@@ -37,7 +37,7 @@ AP_HSM::AP_HSM() {
     // Initialize mock storage
     memset(_mock_storage, 0, sizeof(_mock_storage));
     _mock_initialized = false;
-    hal.console->printf("HSM: [MOCK MODE] Mock HSM storage initialized\n");
+    // Note: Don't print here - console might not be ready yet
 #endif
 }
 
@@ -228,8 +228,18 @@ bool AP_HSM::update_init()
         return true;  // Terminé
     }
 
+#if AP_HSM_MOCK_ENABLED
+    // Mock mode: simulate instant completion
     if (_init_state == InitState::NOT_STARTED) {
-        return true;  // Pas démarré
+        hal.console->printf("HSM: [MOCK] update_init() - simulating instant completion\n");
+        _mock_initialized = true;
+        _init_state = InitState::COMPLETE;
+        return true;
+    }
+#endif
+
+    if (_init_state == InitState::NOT_STARTED) {
+        return true;  // Pas démarré (real HSM)
     }
 
     uint32_t elapsed = AP_HAL::millis() - _init_step_start_ms;

@@ -4656,7 +4656,7 @@ void GCS_MAVLINK::handle_message(const mavlink_message_t &msg)
     case MAVLINK_MSG_ID_HSM_WK_EXCHANGE:
     {
         hal.console->printf("KEP: >>> Received HSM_WK_EXCHANGE from sysid=%d\n", msg.sysid);
-        ;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK_EXCH recv sysid=%d", msg.sysid);
         KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
         if (kep != nullptr) {
             mavlink_hsm_wk_exchange_t packet;
@@ -4664,12 +4664,14 @@ void GCS_MAVLINK::handle_message(const mavlink_message_t &msg)
             hal.console->printf("KEP: WK received: %02X%02X%02X%02X...\n",
                    packet.wk_public[0], packet.wk_public[1],
                    packet.wk_public[2], packet.wk_public[3]);
-            ;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK:%02X%02X%02X%02X",
+                   packet.wk_public[0], packet.wk_public[1],
+                   packet.wk_public[2], packet.wk_public[3]);
             kep->handle_wk_exchange(msg.sysid, msg.compid,
                                     packet.wk_public, packet.timestamp);
         } else {
             hal.console->printf("KEP: ERROR - singleton is NULL!\n");
-            ;
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: singleton NULL!");
         }
         break;
     }

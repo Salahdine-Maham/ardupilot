@@ -1,8 +1,0 @@
-Setting SIM_SPEEDUP=1.000000
-Suggested EK3_DRAG_BCOEF_* = 17.209, EK3_DRAG_MCOEF = 0.209
-Starting sketch 'ArduCopter'
-Starting SITL input
-Using Irlock at port : 9005
-bind port 5760 for SERIAL0
-SERIAL0 on TCP port 5760
-Waiting for connection ....

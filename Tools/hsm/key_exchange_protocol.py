@@ -301,7 +301,7 @@ class KeyExchangeProtocol:
         payload = struct.pack('<BB', peer.sysid, peer.compid)
         payload += ephemeral_pub      # 64 bytes
         payload += encrypted_dek      # 32 bytes
-        payload += nonce              # 12 bytes
+        payload += nonce              # 24 bytes (XChaCha20-Poly1305)
         payload += tag                # 16 bytes
 
         self._send_callback(MAVLINK_MSG_ID_HSM_DEK_EXCHANGE, peer.sysid, peer.compid, payload)
@@ -376,7 +376,7 @@ class KeyExchangeProtocol:
             src_compid: Source component ID
             ephemeral_pub: ECIES ephemeral public key (64 bytes)
             encrypted_dek: Encrypted DEK (32 bytes)
-            nonce: ChaCha20 nonce (12 bytes)
+            nonce: XChaCha20 nonce (24 bytes)
             tag: Poly1305 tag (16 bytes)
         """
         peer = self.find_peer(src_sysid, src_compid)

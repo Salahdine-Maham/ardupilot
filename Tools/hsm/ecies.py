@@ -5,11 +5,11 @@ ECIES (Elliptic Curve Integrated Encryption Scheme) Implementation
 Utilise:
 - ECDH sur secp256r1 (P-256) pour l'échange de clé
 - HKDF-SHA256 pour la dérivation de clé
-- ChaCha20-Poly1305 pour le chiffrement AEAD
+- XChaCha20-Poly1305 pour le chiffrement AEAD (24-byte nonce)
 
-Compatible avec l'implémentation C++ de KeyExchangeProtocol.
+Compatible avec l'implémentation C++ de KeyExchangeProtocol (Monocypher).
 
-Date: 2026-01-24
+Date: 2026-01-25
 """
 
 import os
@@ -22,20 +22,27 @@ try:
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
     from cryptography.hazmat.backends import default_backend
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
     print("WARNING: cryptography library not available. Install with: pip install cryptography")
 
+# Try to import PyNaCl for XChaCha20-Poly1305
+try:
+    import nacl.bindings
+    NACL_AVAILABLE = True
+except ImportError:
+    NACL_AVAILABLE = False
+    print("WARNING: PyNaCl library not available. Install with: pip install pynacl")
+
 
 # Constants
 CURVE = ec.SECP256R1()
 KEY_SIZE = 32
-NONCE_SIZE = 12
+NONCE_SIZE = 24      # XChaCha20-Poly1305 uses 24-byte nonce
 TAG_SIZE = 16
-PUBKEY_SIZE = 64  # Uncompressed X||Y (sans le prefix 0x04)
+PUBKEY_SIZE = 64     # Uncompressed X||Y (sans le prefix 0x04)
 
 # HKDF parameters (must match C++ implementation)
 ECIES_SALT = b"ECIES-Salt"
@@ -45,6 +52,7 @@ ECIES_INFO = b"DEK-Encryption-v1"
 class ECIES:
     """
     ECIES encryption/decryption for DEK exchange
+    Uses XChaCha20-Poly1305 (compatible with Monocypher crypto_lock/crypto_unlock)
     """
 
     @staticmethod
@@ -157,6 +165,63 @@ class ECIES:
         return hkdf.derive(shared_secret)
 
     @staticmethod
+    def xchacha20_poly1305_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> Tuple[bytes, bytes]:
+        """
+        Encrypt with XChaCha20-Poly1305 using PyNaCl
+
+        Args:
+            key: 32-byte encryption key
+            nonce: 24-byte nonce
+            plaintext: data to encrypt
+
+        Returns:
+            Tuple[ciphertext, tag (16 bytes)]
+        """
+        if not NACL_AVAILABLE:
+            raise RuntimeError("PyNaCl library required for XChaCha20-Poly1305")
+
+        # PyNaCl XChaCha20-Poly1305 IETF
+        # Returns ciphertext + tag (tag appended)
+        ciphertext_with_tag = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+            plaintext, None, nonce, key
+        )
+
+        # Split ciphertext and tag (tag is last 16 bytes)
+        ciphertext = ciphertext_with_tag[:-TAG_SIZE]
+        tag = ciphertext_with_tag[-TAG_SIZE:]
+
+        return ciphertext, tag
+
+    @staticmethod
+    def xchacha20_poly1305_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> Optional[bytes]:
+        """
+        Decrypt with XChaCha20-Poly1305 using PyNaCl
+
+        Args:
+            key: 32-byte encryption key
+            nonce: 24-byte nonce
+            ciphertext: encrypted data
+            tag: 16-byte authentication tag
+
+        Returns:
+            Decrypted plaintext or None if authentication fails
+        """
+        if not NACL_AVAILABLE:
+            raise RuntimeError("PyNaCl library required for XChaCha20-Poly1305")
+
+        try:
+            # PyNaCl expects ciphertext + tag concatenated
+            ciphertext_with_tag = ciphertext + tag
+
+            plaintext = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+                ciphertext_with_tag, None, nonce, key
+            )
+            return plaintext
+        except Exception as e:
+            print(f"[ECIES] XChaCha20 decryption failed: {e}")
+            return None
+
+    @staticmethod
     def encrypt_dek(peer_wk_public: bytes, dek: bytes) -> Tuple[bytes, bytes, bytes, bytes]:
         """
         Encrypt DEK using ECIES for a peer
@@ -167,7 +232,7 @@ class ECIES:
 
         Returns:
             Tuple[ephemeral_public (64 bytes), encrypted_dek (32 bytes),
-                  nonce (12 bytes), tag (16 bytes)]
+                  nonce (24 bytes), tag (16 bytes)]
         """
         if not CRYPTO_AVAILABLE:
             raise RuntimeError("cryptography library required")
@@ -181,16 +246,11 @@ class ECIES:
         # 3. Derive encryption key via HKDF
         encryption_key = ECIES.hkdf_derive(shared_secret)
 
-        # 4. Generate random nonce
+        # 4. Generate random nonce (24 bytes for XChaCha20)
         nonce = os.urandom(NONCE_SIZE)
 
-        # 5. Encrypt with ChaCha20-Poly1305
-        chacha = ChaCha20Poly1305(encryption_key)
-        ciphertext_with_tag = chacha.encrypt(nonce, dek, None)
-
-        # Split ciphertext and tag
-        encrypted_dek = ciphertext_with_tag[:KEY_SIZE]
-        tag = ciphertext_with_tag[KEY_SIZE:]
+        # 5. Encrypt with XChaCha20-Poly1305
+        encrypted_dek, tag = ECIES.xchacha20_poly1305_encrypt(encryption_key, nonce, dek)
 
         # Clear sensitive data
         del ephemeral_private
@@ -209,7 +269,7 @@ class ECIES:
             my_wk_private: Our Wrapper Key private (32 bytes)
             ephemeral_public: Sender's ephemeral public key (64 bytes)
             encrypted_dek: Encrypted DEK (32 bytes)
-            nonce: ChaCha20 nonce (12 bytes)
+            nonce: XChaCha20 nonce (24 bytes)
             tag: Poly1305 tag (16 bytes)
 
         Returns:
@@ -225,10 +285,8 @@ class ECIES:
             # 2. Derive same encryption key
             encryption_key = ECIES.hkdf_derive(shared_secret)
 
-            # 3. Decrypt with ChaCha20-Poly1305
-            chacha = ChaCha20Poly1305(encryption_key)
-            ciphertext_with_tag = encrypted_dek + tag
-            dek = chacha.decrypt(nonce, ciphertext_with_tag, None)
+            # 3. Decrypt with XChaCha20-Poly1305
+            dek = ECIES.xchacha20_poly1305_decrypt(encryption_key, nonce, encrypted_dek, tag)
 
             # Clear sensitive data
             del shared_secret
@@ -248,11 +306,15 @@ class ECIES:
 def test_ecies():
     """Test ECIES encrypt/decrypt roundtrip"""
     print("=" * 50)
-    print("  ECIES Test")
+    print("  ECIES Test (XChaCha20-Poly1305)")
     print("=" * 50)
 
     if not CRYPTO_AVAILABLE:
         print("SKIP: cryptography library not available")
+        return False
+
+    if not NACL_AVAILABLE:
+        print("SKIP: PyNaCl library not available")
         return False
 
     # Generate keypairs for Alice and Bob
@@ -267,11 +329,11 @@ def test_ecies():
     print(f"\n2. Alice DEK: {alice_dek[:8].hex()}...")
 
     # Alice encrypts DEK for Bob
-    print("\n3. Alice encrypts DEK for Bob...")
+    print("\n3. Alice encrypts DEK for Bob (XChaCha20-Poly1305)...")
     ephemeral_pub, encrypted_dek, nonce, tag = ECIES.encrypt_dek(bob_public, alice_dek)
     print(f"   Ephemeral pub: {ephemeral_pub[:8].hex()}...")
     print(f"   Encrypted DEK: {encrypted_dek[:8].hex()}...")
-    print(f"   Nonce: {nonce.hex()}")
+    print(f"   Nonce (24 bytes): {nonce.hex()}")
     print(f"   Tag: {tag.hex()}")
 
     # Bob decrypts DEK

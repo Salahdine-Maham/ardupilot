@@ -27,7 +27,9 @@ def build(bld):
             'AC_AutoTune',
             'AP_KDECAN',
             'AP_SurfaceDistance',
-            'AP_HSM'
+            'AP_HSM',
+            'micro-ecc',
+            'AP_Crypto'
         ],
     )
 

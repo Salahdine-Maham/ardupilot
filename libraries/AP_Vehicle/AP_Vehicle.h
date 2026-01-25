@@ -82,6 +82,10 @@
 
 #include <AP_IBus_Telem/AP_IBus_Telem.h>
 
+#ifndef AP_HSM_ENABLED
+#define AP_HSM_ENABLED 1
+#endif
+
 class AP_DDS_Client;
 
 class AP_Vehicle : public AP_HAL::HAL::Callbacks {
@@ -557,6 +561,13 @@ private:
     // decimation for 1Hz update
     uint8_t one_Hz_counter;
     void one_Hz_update();
+
+#if AP_HSM_ENABLED
+    // HSM async update - called by scheduler
+    void hsm_update();
+    bool _hsm_init_done = false;
+    bool _hsm_ko_init_done = false;
+#endif
 
     bool likely_flying;         // true if vehicle is probably flying
     uint32_t _last_flying_ms;   // time when likely_flying last went true
