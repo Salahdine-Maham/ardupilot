@@ -507,34 +507,8 @@ void KeyExchangeProtocol::handle_key_ack(uint8_t src_sysid, uint8_t src_compid,
 // =============================================================================
 // ECIES IMPLEMENTATION
 // =============================================================================
-
-// Test ephemeral keypair for Pixhawk (uECC crashes on ARM)
-// WARNING: For testing only - NOT secure for production!
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
-static const uint8_t TEST_EPHEMERAL_PRIVATE[32] = {
-    0xA3, 0x4B, 0x2C, 0x8D, 0x5E, 0x1F, 0x90, 0x67,
-    0x23, 0xE4, 0xD5, 0xB6, 0x87, 0x48, 0xC9, 0x0A,
-    0xFB, 0x3C, 0x6D, 0x9E, 0x2F, 0x50, 0xA1, 0x72,
-    0xE3, 0x14, 0x85, 0xF6, 0x47, 0xB8, 0x09, 0xCA
-};
-static const uint8_t TEST_EPHEMERAL_PUBLIC[64] = {
-    0x7B, 0x8C, 0x1D, 0x2E, 0x3F, 0x40, 0x51, 0x62,
-    0x73, 0x84, 0x95, 0xA6, 0xB7, 0xC8, 0xD9, 0xEA,
-    0xFB, 0x0C, 0x1D, 0x2E, 0x3F, 0x40, 0x51, 0x62,
-    0x73, 0x84, 0x95, 0xA6, 0xB7, 0xC8, 0xD9, 0xEA,
-    0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89,
-    0x9A, 0xAB, 0xBC, 0xCD, 0xDE, 0xEF, 0xF0, 0x01,
-    0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89,
-    0x9A, 0xAB, 0xBC, 0xCD, 0xDE, 0xEF, 0xF0, 0x01
-};
-// Fixed shared secret for test (derived from test keys)
-static const uint8_t TEST_SHARED_SECRET[32] = {
-    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
-    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
-    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0
-};
-#endif
+// Note: uECC now works on both SITL (x86_64) and Pixhawk (ARM Cortex-M7)
+// thanks to proper platform detection in uECC_config.h
 
 bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY_SIZE],
                                              const uint8_t dek[KEP_KEY_SIZE],
@@ -544,20 +518,16 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
                                              uint8_t tag_out[KEP_TAG_SIZE])
 {
     uint8_t shared_secret[32];
-
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // SITL: Use real ECIES with uECC
+    uint8_t ephemeral_priv[32];
     uECC_Curve curve = uECC_secp256r1();
 
     // 1. Generate ephemeral keypair
-    uint8_t ephemeral_priv[32];
     if (uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve) != 1) {
         hal.console->printf("KEP: ERROR - Ephemeral key generation failed\n");
         return false;
     }
-    hal.console->printf("KEP: Ephemeral pub (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
-           ephemeral_pub_out[0], ephemeral_pub_out[1], ephemeral_pub_out[2], ephemeral_pub_out[3],
-           ephemeral_pub_out[4], ephemeral_pub_out[5], ephemeral_pub_out[6], ephemeral_pub_out[7]);
+    hal.console->printf("KEP: Ephemeral pub: %02X%02X%02X%02X...\n",
+           ephemeral_pub_out[0], ephemeral_pub_out[1], ephemeral_pub_out[2], ephemeral_pub_out[3]);
 
     // 2. ECDH: shared_secret = ephemeral_priv * peer_wk_pub
     if (!ecdh_compute_shared(ephemeral_priv, peer_wk_pub, shared_secret)) {
@@ -566,13 +536,6 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
         return false;
     }
     secure_zero(ephemeral_priv, 32);
-#else
-    // Pixhawk: Use test keys (uECC crashes on ARM)
-    // WARNING: For testing only - NOT secure for production!
-    hal.console->printf("KEP: Using TEST ephemeral (Pixhawk bypass)\n");
-    memcpy(ephemeral_pub_out, TEST_EPHEMERAL_PUBLIC, KEP_PUBKEY_SIZE);
-    memcpy(shared_secret, TEST_SHARED_SECRET, 32);
-#endif
 
     // 3. Derive encryption key via HKDF
     uint8_t encryption_key[32];
@@ -609,8 +572,6 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
 {
     uint8_t shared_secret[32];
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // SITL: Use real ECIES with uECC
     // 1. Get our WK private from KeyOrchestrator
     const uint8_t* my_wk_priv = _key_orch->get_wk_private();
     if (my_wk_priv == nullptr) {
@@ -623,14 +584,6 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
         hal.console->printf("KEP: ERROR - ECDH decryption failed\n");
         return false;
     }
-#else
-    // Pixhawk: Use test shared secret (uECC crashes on ARM)
-    // WARNING: For testing only - NOT secure for production!
-    // This won't actually decrypt the real ECIES envelope from GCS,
-    // but allows testing the message flow
-    hal.console->printf("KEP: Using TEST shared secret (Pixhawk bypass)\n");
-    memcpy(shared_secret, TEST_SHARED_SECRET, 32);
-#endif
 
     // 3. Derive same encryption key
     uint8_t encryption_key[32];
@@ -642,20 +595,10 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
     // 4. Decrypt with ChaCha20-Poly1305
     if (!chacha_decrypt(encryption_key, nonce, encrypted_dek, KEP_KEY_SIZE,
                         tag, dek_out)) {
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
-        // Pixhawk test mode: accept failure but generate fake DEK for testing
-        hal.console->printf("KEP: WARN - ECIES decrypt failed (expected in test mode)\n");
-        hal.console->printf("KEP: Using random DEK for testing\n");
-        hal.util->get_random_vals(dek_out, KEP_KEY_SIZE);
-        secure_zero(shared_secret, 32);
-        secure_zero(encryption_key, 32);
-        return true;  // Continue for testing
-#else
         hal.console->printf("KEP: ERROR - ChaCha20 decryption failed (auth error)\n");
         secure_zero(shared_secret, 32);
         secure_zero(encryption_key, 32);
         return false;
-#endif
     }
 
     // 5. Cleanup

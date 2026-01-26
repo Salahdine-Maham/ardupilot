@@ -31,32 +31,8 @@ static const uint8_t P256_ORDER[32] = {
     0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// TEST KEYPAIR FOR PIXHAWK (uECC crashes on ARM Cortex-M7)
-// Valid P-256 keypair generated 2026-01-26
-// WARNING: For testing only - NOT secure for production!
-// ═══════════════════════════════════════════════════════════════════════════
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
-// Private key (32 bytes)
-static const uint8_t TEST_WK_PRIVATE[32] = {
-    0x62, 0x7C, 0x7F, 0xA1, 0x06, 0x6C, 0xB7, 0xAE,
-    0xFF, 0x04, 0xA0, 0x92, 0x75, 0x10, 0x24, 0x6A,
-    0xEF, 0x6D, 0xB8, 0xA6, 0x3B, 0xF3, 0x88, 0x92,
-    0x17, 0xFC, 0x2E, 0x86, 0xE8, 0x0F, 0x1A, 0xE9
-};
-
-// Public key (64 bytes = X || Y)
-static const uint8_t TEST_WK_PUBLIC[64] = {
-    0xDD, 0x08, 0x68, 0x0F, 0xC5, 0x06, 0x87, 0xFA,
-    0x70, 0xA6, 0x1B, 0x29, 0xDE, 0x9E, 0x24, 0xC8,
-    0xFF, 0x14, 0x9D, 0x4C, 0x79, 0x3D, 0x8E, 0xF8,
-    0x06, 0xD0, 0xCD, 0x83, 0xB8, 0x00, 0x88, 0xE6,
-    0x0B, 0x05, 0x84, 0x58, 0x21, 0x08, 0x3B, 0x4B,
-    0xF0, 0x1B, 0x86, 0x2B, 0x59, 0x21, 0x3E, 0x99,
-    0x31, 0x20, 0xFC, 0xB5, 0x1D, 0x0A, 0x36, 0xCD,
-    0x9C, 0xD9, 0x1A, 0xA2, 0x28, 0x81, 0x9A, 0xF1
-};
-#endif
+// Note: uECC now works on both SITL (x86_64) and Pixhawk (ARM Cortex-M7)
+// thanks to proper platform detection in uECC_config.h
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTRUCTEUR ET SINGLETON
@@ -142,22 +118,13 @@ bool KeyOrchestrator::init_mission_keys()
     hal.console->printf("KeyOrch: [2] WK_priv=%02X%02X%02X%02X\n",
            _wk_private[0], _wk_private[1], _wk_private[2], _wk_private[3]);
 
-    // Step 3: Compute WK_public
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // SITL: Use uECC to compute real public key (works on x86)
-    hal.console->printf("KeyOrch: [3] Computing WK_pub with uECC (SITL)...\n");
+    // Step 3: Compute WK_public from WK_private using uECC
+    hal.console->printf("KeyOrch: [3] Computing WK_pub with uECC...\n");
     uECC_Curve curve = uECC_secp256r1();
     if (uECC_compute_public_key(_wk_private, _wk_public, curve) != 1) {
-        hal.console->printf("KeyOrch: uECC FAIL\n");
+        hal.console->printf("KeyOrch: uECC_compute_public_key FAILED\n");
         return false;
     }
-#else
-    // Pixhawk: Use hardcoded valid P-256 test keypair (uECC crashes on ARM)
-    // WARNING: For testing only - NOT secure for production!
-    hal.console->printf("KeyOrch: [3] Using TEST keypair (Pixhawk)...\n");
-    memcpy(_wk_private, TEST_WK_PRIVATE, KEY_SIZE);
-    memcpy(_wk_public, TEST_WK_PUBLIC, WK_PUBLIC_SIZE);
-#endif
     hal.console->printf("KeyOrch: [3] WK_pub=%02X%02X%02X%02X\n",
            _wk_public[0], _wk_public[1], _wk_public[2], _wk_public[3]);
 
