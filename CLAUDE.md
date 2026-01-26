@@ -31,6 +31,8 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 60
 
 | Commit | Feature | Description |
 |--------|---------|-------------|
+| `2c13981c60` | Session 6 | Fix key exchange: RNG + peer reset + GCS heartbeats |
+| `75656daedf` | Session 5 | Fix uECC crash on ARM Cortex-M7 (platform detection) |
 | `2d7b310a78` | Feature 3 | DualDekEngine - Chiffrement MAVLink End-to-End |
 | `46575f08f9` | Feature 2.2 | Key Exchange Protocol - Implementation |
 | `49cb78d04b` | Feature 1 | Organisation et documentation complète |
@@ -44,10 +46,11 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 60
 |---------|--------|-------|
 | 1: AP_HSM init | ✅ DONE | Blocking init ~25s (SITL), instant (Pixhawk Mock) |
 | 2.1: KeyOrchestrator | ✅ DONE | MK+WK+DEK stored in HSM |
-| 2.2: Key Exchange Protocol | ✅ DONE | SITL: real crypto, Pixhawk: test keys bypass |
+| 2.2: Key Exchange Protocol | ✅ DONE | Full ECIES crypto on SITL + Pixhawk |
 | 3: Dual-DEK Engine | ✅ DONE | TX/RX encryption, deterministic nonce |
 | **Mock HSM** | ✅ DONE | Test Pixhawk sans câble TELEM2 |
-| **Pixhawk KEP** | ✅ DONE | Full protocol (uECC bypass) - Session 4 |
+| **Pixhawk KEP** | ✅ DONE | Full bidirectional exchange - Session 6 |
+| **Peer Reset** | ✅ DONE | 30s timeout allows re-exchange without reboot |
 
 ---
 
@@ -657,6 +660,7 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 | BAD_DATA spam | Messages chiffrés = BAD_CRC côté GCS Python | Filtrer avec `grep -v BAD_DATA` |
 | ~~uECC crash ARM~~ | ~~Toutes les fonctions uECC crashent sur Pixhawk5X~~ | **RÉSOLU** Session 5 - Fix config platform |
 | ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 5 |
+| ~~DEK not sent~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | **RÉSOLU** Session 6 |
 
 ---
 
@@ -666,10 +670,11 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 |----------|------|-------------|--------|
 | 1 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
 | 2 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
-| 3 | **Câble TELEM2** | Quand reçu: désactiver Mock, brancher HSM | ⏳ Attente câble |
-| 4 | **Peer state reset** | Reset état peer pour re-exchange (après reboot) | ⏳ Enhancement |
-| 5 | Multi-drone | Tester avec 2+ drones mesh | |
-| 6 | DEK rotation | Rotation de clés en vol | |
+| 3 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
+| 4 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
+| 5 | **Câble TELEM2** | Quand reçu: désactiver Mock, brancher HSM | ⏳ Attente câble |
+| 6 | Multi-drone | Tester avec 2+ drones mesh | |
+| 7 | DEK rotation | Rotation de clés en vol | |
 
 ---
 
@@ -915,6 +920,68 @@ Ceci compilait du code 64-bit sur processeur 32-bit → crash!
 
 **Commit:** `75656daedf` - Fix uECC crash on ARM Cortex-M7
 
+### Session 6: Full Key Exchange Working! ✅
+
+**Date:** 2026-01-26
+
+**Problème découvert:** ECIES encryption échouait - `uECC_make_key()` retournait 0.
+
+**Cause:** Le RNG n'était pas configuré pour uECC dans `KeyExchangeProtocol::ecies_encrypt_dek()`.
+`uECC_set_rng()` était appelé dans `KeyOrchestrator` mais pas dans `KeyExchangeProtocol`.
+
+**Solution 1 - Fix RNG (KeyExchangeProtocol.cpp):**
+```cpp
+// RNG callback for uECC
+static int kep_rng_callback(uint8_t* dest, unsigned int size) {
+    if (hal.util->get_random_vals(dest, size)) return 1;
+    return 0;
+}
+
+bool KeyExchangeProtocol::ecies_encrypt_dek(...) {
+    uECC_set_rng(&kep_rng_callback);  // MUST call before uECC_make_key
+    // ...
+}
+```
+
+**Solution 2 - Peer Reset (KeyExchangeProtocol.cpp):**
+```cpp
+#define KEP_PEER_RESET_TIMEOUT_MS  30000  // 30 seconds
+
+// In on_heartbeat_received():
+if (inactive_time > KEP_PEER_RESET_TIMEOUT_MS &&
+    (peer->state == COMPLETE || peer->state == ERROR)) {
+    peer->state = State::IDLE;  // Reset for re-exchange
+}
+```
+
+**Solution 3 - GCS Heartbeats (gcs_kep_client.py):**
+```python
+def _send_heartbeat(self):
+    self.mav.mav.heartbeat_send(6, 8, 0, 0, 4)  # MAV_TYPE_GCS
+
+# Send periodic heartbeats so Pixhawk detects GCS peer
+```
+
+**Changements:**
+- `libraries/AP_HSM/KeyExchangeProtocol.cpp` - RNG fix + peer reset + debug logs
+- `Tools/hsm/gcs_kep_client.py` - GCS heartbeats + STATUSTEXT display
+- `libraries/GCS_MAVLink/GCS_MAVLink.cpp` - STATUSTEXT plaintext for debug
+
+**Résultat - Échange bidirectionnel complet:**
+```
+✅ uECC_make_key() fonctionne (RNG configuré)
+✅ uECC_shared_secret() fonctionne
+✅ ECIES encryption/decryption OK
+✅ WK_EXCHANGE bidirectionnel
+✅ DEK_EXCHANGE bidirectionnel (enfin!)
+✅ Peer reset après 30s (re-exchange sans reboot)
+✅ GCS heartbeats détectés par Pixhawk
+✅ state=COMPLETE wk_recv=True dek_recv=True
+✅ Peer DEKs stored: 1
+```
+
+**Commit:** `2c13981c60` - Fix key exchange: RNG + peer reset + GCS heartbeats
+
 ---
 
 ## Environment
@@ -929,4 +996,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-01-26 (Session 5) - uECC FIX! Vraie crypto P-256 fonctionne sur Pixhawk5X. Cause: uECC_config.h forçait x86_64 sur ARM. Fix: auto-detect platform. WK public key 85886055... générée par uECC (pas hardcodé)!
+**Last update:** 2026-01-26 (Session 6) - FULL KEY EXCHANGE WORKING! Problème: uECC_make_key() échouait car RNG pas configuré. Fix: appel uECC_set_rng() + peer reset timeout 30s + GCS heartbeats. Échange bidirectionnel complet sur Pixhawk5X avec Mock HSM!
