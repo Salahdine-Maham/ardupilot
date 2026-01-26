@@ -655,8 +655,8 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 | No MAC on payload | ChaCha20 stream cipher sans authentification | CRC MAVLink sert de checksum (pas crypto) |
 | Single connection SITL | SITL s'arrête si connexion TCP fermée | Garder connexion ouverte ou reconnecter |
 | BAD_DATA spam | Messages chiffrés = BAD_CRC côté GCS Python | Filtrer avec `grep -v BAD_DATA` |
-| **uECC crash ARM** | Toutes les fonctions uECC crashent sur Pixhawk5X | Clés de test hardcodées (voir Session 4) |
-| ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 4 |
+| ~~uECC crash ARM~~ | ~~Toutes les fonctions uECC crashent sur Pixhawk5X~~ | **RÉSOLU** Session 5 - Fix config platform |
+| ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 5 |
 
 ---
 
@@ -664,10 +664,10 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 
 | Priority | Task | Description | Status |
 |----------|------|-------------|--------|
-| 1 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 4) |
-| 2 | **Câble TELEM2** | Quand reçu: désactiver Mock, brancher HSM | ⏳ Attente câble |
-| 3 | RX decrypt Python | Décrypter messages chiffrés dans gcs_kep_client.py | ✅ DONE (Session 3) |
-| 4 | **Fix uECC ARM** | Remplacer micro-ecc par autre lib ECC (mbedtls?) | ⏳ Optionnel |
+| 1 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
+| 2 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
+| 3 | **Câble TELEM2** | Quand reçu: désactiver Mock, brancher HSM | ⏳ Attente câble |
+| 4 | **Peer state reset** | Reset état peer pour re-exchange (après reboot) | ⏳ Enhancement |
 | 5 | Multi-drone | Tester avec 2+ drones mesh | |
 | 6 | DEK rotation | Rotation de clés en vol | |
 
@@ -873,6 +873,48 @@ Flux observé:
 - `libraries/AP_HSM/KeyOrchestrator.cpp` - TEST_WK_PRIVATE/PUBLIC hardcodées
 - `libraries/AP_HSM/KeyExchangeProtocol.cpp` - ECIES bypass avec clés de test
 
+### Session 5: Fix uECC - REAL CRYPTO WORKS! ✅
+
+**Date:** 2026-01-26
+
+**Problème découvert:** uECC_config.h forçait la plateforme x86_64 même sur ARM:
+```cpp
+// AVANT (FAUX):
+#define uECC_PLATFORM 2  /* uECC_x86_64 */
+#define uECC_WORD_SIZE 8
+```
+
+Ceci compilait du code 64-bit sur processeur 32-bit → crash!
+
+**Solution:** Auto-détection de plateforme via macros compilateur:
+```cpp
+// APRÈS (CORRECT):
+#if defined(__x86_64__)
+    #define uECC_PLATFORM uECC_x86_64
+    #define uECC_WORD_SIZE 8
+#elif defined(__arm__)
+    #define uECC_PLATFORM uECC_arm_thumb2
+    #define uECC_WORD_SIZE 4
+    #define uECC_ARM_USE_UMAAL 0
+#endif
+```
+
+**Changements:**
+- `libraries/micro-ecc/uECC_config.h` - Auto-detect platform
+- `libraries/AP_HSM/KeyOrchestrator.cpp` - Supprimé bypass test keys
+- `libraries/AP_HSM/KeyExchangeProtocol.cpp` - Supprimé ECIES bypass
+
+**Résultat - Vraie crypto P-256 sur Pixhawk5X:**
+```
+✅ uECC_compute_public_key() fonctionne!
+✅ uECC_make_key() fonctionne!
+✅ uECC_shared_secret() fonctionne!
+✅ WK_EXCHANGE bidirectionnel avec vraie clé (85886055...)
+✅ KEY_ACK (WK_RECEIVED + DEK_RECEIVED) reçus
+```
+
+**Commit:** `75656daedf` - Fix uECC crash on ARM Cortex-M7
+
 ---
 
 ## Environment
@@ -887,4 +929,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-01-26 (Session 4) - Pixhawk KEP complet! Bypass uECC avec clés de test. WK+DEK+KEY_ACK bidirectionnel fonctionne sur Pixhawk5X. Prochaine étape: remplacer micro-ecc par lib ARM-compatible ou attendre câble TELEM2.
+**Last update:** 2026-01-26 (Session 5) - uECC FIX! Vraie crypto P-256 fonctionne sur Pixhawk5X. Cause: uECC_config.h forçait x86_64 sur ARM. Fix: auto-detect platform. WK public key 85886055... générée par uECC (pas hardcodé)!
