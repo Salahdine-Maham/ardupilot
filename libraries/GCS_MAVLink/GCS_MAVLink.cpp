@@ -197,10 +197,10 @@ void comm_send_buffer(mavlink_channel_t chan, const uint8_t *buf, uint8_t len)
 
     const bool is_payload = (current_buffer == 1);  // Le 2ème buffer = payload
 
-    // Messages qui doivent rester en clair (peer discovery + key exchange)
-    // HEARTBEAT=0, HSM_WK_EXCHANGE=12000, HSM_DEK_EXCHANGE=12001, HSM_KEY_ACK=12002
+    // Messages qui doivent rester en clair (peer discovery + key exchange + debug)
+    // HEARTBEAT=0, STATUSTEXT=253, HSM_WK_EXCHANGE=12000, HSM_DEK_EXCHANGE=12001, HSM_KEY_ACK=12002
     const uint32_t msgid = tx_header_info[chan].msgid;
-    const bool is_plaintext_msg = (msgid == 0 || msgid == 12000 || msgid == 12001 || msgid == 12002);
+    const bool is_plaintext_msg = (msgid == 0 || msgid == 253 || msgid == 12000 || msgid == 12001 || msgid == 12002);
 
     if (gcs().get_mav_encrypt() != 0 && is_payload && tx_header_info[chan].valid && !is_plaintext_msg) {
         // Utilise KeyOrchestrator pour la DEK (Feature 2.1)

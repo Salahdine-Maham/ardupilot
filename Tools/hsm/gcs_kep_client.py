@@ -454,6 +454,24 @@ class GCSKeyExchangeClient:
         # For now, log warning
         self._log("WARNING: Raw message sending not implemented", "WARN")
 
+    def _send_heartbeat(self):
+        """Send a heartbeat message to announce our presence"""
+        try:
+            # GCS type: MAV_TYPE_GCS = 6
+            # Autopilot: MAV_AUTOPILOT_INVALID = 8 (for GCS)
+            # Base mode: 0
+            # Custom mode: 0
+            # System status: MAV_STATE_ACTIVE = 4
+            self.mav.mav.heartbeat_send(
+                6,   # type: MAV_TYPE_GCS
+                8,   # autopilot: MAV_AUTOPILOT_INVALID
+                0,   # base_mode
+                0,   # custom_mode
+                4    # system_status: MAV_STATE_ACTIVE
+            )
+        except Exception as e:
+            self._log(f"Failed to send heartbeat: {e}", "DEBUG")
+
     def handle_message(self, msg):
         """Handle incoming MAVLink message"""
         msg_type = msg.get_type()
@@ -506,6 +524,16 @@ class GCSKeyExchangeClient:
                     self._log("=" * 50)
                     self.exchange_complete = True
                     self._init_dual_dek_engine(msg.get_srcSystem())
+
+        elif msg_type == 'STATUSTEXT':
+            # Display status text from Pixhawk (debug logs)
+            try:
+                severity = msg.severity
+                text = msg.text.rstrip('\x00')
+                sev_names = {0: 'EMERG', 1: 'ALERT', 2: 'CRIT', 3: 'ERR', 4: 'WARN', 5: 'NOTICE', 6: 'INFO', 7: 'DEBUG'}
+                self._log(f"[STATUSTEXT] [{sev_names.get(severity, severity)}] {text}")
+            except Exception as e:
+                self._log(f"[STATUSTEXT] (parse error: {e})")
 
         elif msg_type == 'HSM_KEY_ACK':
             self._log(f">>> Received HSM_KEY_ACK from sysid={msg.get_srcSystem()}")
@@ -841,12 +869,17 @@ class GCSKeyExchangeClient:
         if not self.init_kep():
             return False
 
+        # Send initial heartbeat to announce our presence
+        self._send_heartbeat()
+        self._log("Sent initial heartbeat to announce GCS")
+
         self._log("=" * 50)
         self._log("Listening for HSM messages...")
         self._log("=" * 50)
 
         self.running = True
         start_time = time.time()
+        last_heartbeat_time = time.time()
 
         try:
             while self.running:
@@ -855,8 +888,13 @@ class GCSKeyExchangeClient:
                     self._log("Timeout waiting for exchange", "WARN")
                     break
 
+                # Send periodic heartbeat (every 1 second)
+                if time.time() - last_heartbeat_time >= 1.0:
+                    self._send_heartbeat()
+                    last_heartbeat_time = time.time()
+
                 # Receive message
-                msg = self.mav.recv_match(blocking=True, timeout=1.0)
+                msg = self.mav.recv_match(blocking=True, timeout=0.5)
                 if msg:
                     self.handle_message(msg)
 

@@ -26,6 +26,9 @@ static const uint8_t ECIES_INFO[] = "DEK-Encryption-v1";
 #define ECIES_SALT_LEN 10
 #define ECIES_INFO_LEN 17
 
+// Peer reset timeout: if no activity for this long, reset peer to allow re-exchange
+#define KEP_PEER_RESET_TIMEOUT_MS  30000  // 30 seconds
+
 // Singleton
 KeyExchangeProtocol* KeyExchangeProtocol::_singleton = nullptr;
 
@@ -175,9 +178,39 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "KEP: Failed to add peer");
         }
     } else {
-        // Known peer, update timestamp
-        peer->last_activity_ms = AP_HAL::millis();
+        // Known peer - check if we should reset due to inactivity
+        uint32_t now = AP_HAL::millis();
+        uint32_t inactive_time = now - peer->last_activity_ms;
+
+        // If peer was inactive for reset timeout, reset state for re-exchange
+        if (inactive_time > KEP_PEER_RESET_TIMEOUT_MS &&
+            (peer->state == State::COMPLETE ||
+             peer->state == State::ERROR ||
+             peer->state == State::DEK_SENT ||
+             peer->state == State::DEK_RECEIVED)) {
+
+            hal.console->printf("KEP: Resetting peer sysid=%d (inactive %lums)\n",
+                   sysid, (unsigned long)inactive_time);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Peer %d reset for re-exchange", sysid);
+
+            peer->state = State::IDLE;
+            peer->wk_received = false;
+            peer->dek_received = false;
+        }
+
+        // Update timestamp AFTER checking for reset
+        peer->last_activity_ms = now;
+
+        // If peer is IDLE (just reset or was already idle), re-initiate exchange
+        if (peer->state == State::IDLE && _wk_public_ready) {
+            hal.console->printf("KEP: Re-initiating exchange with peer sysid=%d\n", sysid);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Re-exchange with peer %d", sysid);
+            initiate_exchange(sysid, compid);
+        }
     }
+
+    // Also check timeouts for other peers (exchange-in-progress timeouts)
+    check_timeouts();
 }
 
 
@@ -299,9 +332,11 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
 bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
 {
     hal.console->printf("KEP: send_dek_exchange() called\n");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: send_dek_exchange called");
 
     if (peer == nullptr || !peer->wk_received) {
         hal.console->printf("KEP: ERROR - Peer WK not received\n");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - no peer WK");
         return false;
     }
 
@@ -310,9 +345,11 @@ bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
     const uint8_t* my_dek = _key_orch->get_my_dek();
     if (my_dek == nullptr) {
         hal.console->printf("KEP: ERROR - DEK not available\n");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - get_my_dek NULL");
         return false;
     }
     hal.console->printf("KEP: DEK obtained: %02X%02X%02X%02X...\n", my_dek[0], my_dek[1], my_dek[2], my_dek[3]);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK=%02X%02X...", my_dek[0], my_dek[1]);
 
     // Encrypt DEK with ECIES
     uint8_t ephemeral_pub[KEP_PUBKEY_SIZE];
@@ -324,22 +361,28 @@ bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
     if (!ecies_encrypt_dek(peer->wk_public, my_dek,
                            ephemeral_pub, encrypted_dek, nonce, tag)) {
         hal.console->printf("KEP: ERROR - ECIES encryption failed\n");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - ECIES encrypt");
         return false;
     }
     hal.console->printf("KEP: ECIES encryption OK\n");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECIES OK");
 
     hal.console->printf("KEP: DEK_EXCHANGE -> sysid=%d\n", peer->sysid);
 
     // Send on all active MAVLink channels
     uint8_t mask = GCS_MAVLINK::active_channel_mask();
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK->%d mask=0x%02X", peer->sysid, mask);
 
+    uint8_t sent = 0;
     for (uint8_t i = 0; i < MAVLINK_COMM_NUM_BUFFERS; i++) {
         if (mask & (1U << i)) {
             mavlink_channel_t chan = (mavlink_channel_t)(MAVLINK_COMM_0 + i);
             mavlink_msg_hsm_dek_exchange_send(chan, peer->sysid, peer->compid,
                                               ephemeral_pub, encrypted_dek, nonce, tag);
+            sent++;
         }
     }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK sent on %d chans", sent);
 
     return true;
 }
@@ -510,6 +553,15 @@ void KeyExchangeProtocol::handle_key_ack(uint8_t src_sysid, uint8_t src_compid,
 // Note: uECC now works on both SITL (x86_64) and Pixhawk (ARM Cortex-M7)
 // thanks to proper platform detection in uECC_config.h
 
+// RNG callback for uECC - uses ArduPilot's hardware RNG
+static int kep_rng_callback(uint8_t* dest, unsigned int size)
+{
+    if (hal.util->get_random_vals(dest, size)) {
+        return 1;  // Success
+    }
+    return 0;  // Failure
+}
+
 bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY_SIZE],
                                              const uint8_t dek[KEP_KEY_SIZE],
                                              uint8_t ephemeral_pub_out[KEP_PUBKEY_SIZE],
@@ -517,25 +569,39 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
                                              uint8_t nonce_out[KEP_NONCE_SIZE],
                                              uint8_t tag_out[KEP_TAG_SIZE])
 {
+    // Configure RNG for uECC (MUST be called before uECC_make_key)
+    uECC_set_rng(&kep_rng_callback);
+
     uint8_t shared_secret[32];
     uint8_t ephemeral_priv[32];
     uECC_Curve curve = uECC_secp256r1();
 
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECIES start, peer_wk=%02X%02X", peer_wk_pub[0], peer_wk_pub[1]);
+
     // 1. Generate ephemeral keypair
-    if (uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve) != 1) {
-        hal.console->printf("KEP: ERROR - Ephemeral key generation failed\n");
+    hal.console->printf("KEP: Calling uECC_make_key...\n");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Calling uECC_make_key");
+    int result = uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve);
+    if (result != 1) {
+        hal.console->printf("KEP: ERROR - Ephemeral key generation failed (result=%d)\n", result);
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: uECC_make_key FAIL=%d", result);
         return false;
     }
     hal.console->printf("KEP: Ephemeral pub: %02X%02X%02X%02X...\n",
            ephemeral_pub_out[0], ephemeral_pub_out[1], ephemeral_pub_out[2], ephemeral_pub_out[3]);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Ephemeral=%02X%02X", ephemeral_pub_out[0], ephemeral_pub_out[1]);
 
     // 2. ECDH: shared_secret = ephemeral_priv * peer_wk_pub
+    hal.console->printf("KEP: Calling uECC_shared_secret...\n");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Calling ECDH");
     if (!ecdh_compute_shared(ephemeral_priv, peer_wk_pub, shared_secret)) {
         hal.console->printf("KEP: ERROR - ECDH failed\n");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: ECDH FAIL");
         secure_zero(ephemeral_priv, 32);
         return false;
     }
     secure_zero(ephemeral_priv, 32);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECDH OK");
 
     // 3. Derive encryption key via HKDF
     uint8_t encryption_key[32];
@@ -723,11 +789,35 @@ void KeyExchangeProtocol::check_timeouts()
     for (uint8_t i = 0; i < KEP_MAX_PEERS; i++) {
         if (!_peers[i].active) continue;
 
+        uint32_t inactive_time = now - _peers[i].last_activity_ms;
+
+        // Check for peer reset (allows re-exchange after reconnection)
+        // Only reset peers that are in COMPLETE, ERROR, or stuck states
+        if (_peers[i].state == State::COMPLETE ||
+            _peers[i].state == State::ERROR ||
+            _peers[i].state == State::DEK_SENT ||
+            _peers[i].state == State::DEK_RECEIVED) {
+
+            if (inactive_time > KEP_PEER_RESET_TIMEOUT_MS) {
+                hal.console->printf("KEP: Resetting peer sysid=%d (inactive %lums)\n",
+                       _peers[i].sysid, (unsigned long)inactive_time);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Peer %d reset for re-exchange", _peers[i].sysid);
+
+                // Reset peer state for fresh exchange
+                _peers[i].state = State::IDLE;
+                _peers[i].wk_received = false;
+                _peers[i].dek_received = false;
+                // Keep wk_public and dek buffers - they'll be overwritten on new exchange
+                // Keep active = true so we recognize this peer
+            }
+        }
+
+        // Check for exchange timeout (error during active exchange)
         if (_peers[i].state != State::IDLE &&
             _peers[i].state != State::COMPLETE &&
             _peers[i].state != State::ERROR) {
 
-            if ((now - _peers[i].last_activity_ms) > KEP_EXCHANGE_TIMEOUT_MS) {
+            if (inactive_time > KEP_EXCHANGE_TIMEOUT_MS) {
                 hal.console->printf("KEP: TIMEOUT - sysid=%d\n", _peers[i].sysid);
                 _peers[i].state = State::ERROR;
             }
