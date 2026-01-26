@@ -331,25 +331,16 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
 
 bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
 {
-    hal.console->printf("KEP: send_dek_exchange() called\n");
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: send_dek_exchange called");
-
     if (peer == nullptr || !peer->wk_received) {
-        hal.console->printf("KEP: ERROR - Peer WK not received\n");
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - no peer WK");
         return false;
     }
 
     // Get our DEK from KeyOrchestrator
-    hal.console->printf("KEP: Getting DEK from KeyOrchestrator...\n");
     const uint8_t* my_dek = _key_orch->get_my_dek();
     if (my_dek == nullptr) {
-        hal.console->printf("KEP: ERROR - DEK not available\n");
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - get_my_dek NULL");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK not available");
         return false;
     }
-    hal.console->printf("KEP: DEK obtained: %02X%02X%02X%02X...\n", my_dek[0], my_dek[1], my_dek[2], my_dek[3]);
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK=%02X%02X...", my_dek[0], my_dek[1]);
 
     // Encrypt DEK with ECIES
     uint8_t ephemeral_pub[KEP_PUBKEY_SIZE];
@@ -357,33 +348,24 @@ bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
     uint8_t nonce[KEP_NONCE_SIZE];
     uint8_t tag[KEP_TAG_SIZE];
 
-    hal.console->printf("KEP: Calling ecies_encrypt_dek...\n");
     if (!ecies_encrypt_dek(peer->wk_public, my_dek,
                            ephemeral_pub, encrypted_dek, nonce, tag)) {
-        hal.console->printf("KEP: ERROR - ECIES encryption failed\n");
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: DEK fail - ECIES encrypt");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: ECIES encrypt failed");
         return false;
     }
-    hal.console->printf("KEP: ECIES encryption OK\n");
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECIES OK");
-
-    hal.console->printf("KEP: DEK_EXCHANGE -> sysid=%d\n", peer->sysid);
 
     // Send on all active MAVLink channels
     uint8_t mask = GCS_MAVLINK::active_channel_mask();
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK->%d mask=0x%02X", peer->sysid, mask);
 
-    uint8_t sent = 0;
     for (uint8_t i = 0; i < MAVLINK_COMM_NUM_BUFFERS; i++) {
         if (mask & (1U << i)) {
             mavlink_channel_t chan = (mavlink_channel_t)(MAVLINK_COMM_0 + i);
             mavlink_msg_hsm_dek_exchange_send(chan, peer->sysid, peer->compid,
                                               ephemeral_pub, encrypted_dek, nonce, tag);
-            sent++;
         }
     }
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK sent on %d chans", sent);
 
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK sent to %d", peer->sysid);
     return true;
 }
 
@@ -576,32 +558,19 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
     uint8_t ephemeral_priv[32];
     uECC_Curve curve = uECC_secp256r1();
 
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECIES start, peer_wk=%02X%02X", peer_wk_pub[0], peer_wk_pub[1]);
-
     // 1. Generate ephemeral keypair
-    hal.console->printf("KEP: Calling uECC_make_key...\n");
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Calling uECC_make_key");
-    int result = uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve);
-    if (result != 1) {
-        hal.console->printf("KEP: ERROR - Ephemeral key generation failed (result=%d)\n", result);
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: uECC_make_key FAIL=%d", result);
+    if (uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve) != 1) {
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: uECC_make_key failed");
         return false;
     }
-    hal.console->printf("KEP: Ephemeral pub: %02X%02X%02X%02X...\n",
-           ephemeral_pub_out[0], ephemeral_pub_out[1], ephemeral_pub_out[2], ephemeral_pub_out[3]);
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Ephemeral=%02X%02X", ephemeral_pub_out[0], ephemeral_pub_out[1]);
 
     // 2. ECDH: shared_secret = ephemeral_priv * peer_wk_pub
-    hal.console->printf("KEP: Calling uECC_shared_secret...\n");
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Calling ECDH");
     if (!ecdh_compute_shared(ephemeral_priv, peer_wk_pub, shared_secret)) {
-        hal.console->printf("KEP: ERROR - ECDH failed\n");
-        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: ECDH FAIL");
+        GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: ECDH failed");
         secure_zero(ephemeral_priv, 32);
         return false;
     }
     secure_zero(ephemeral_priv, 32);
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: ECDH OK");
 
     // 3. Derive encryption key via HKDF
     uint8_t encryption_key[32];
@@ -616,7 +585,6 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
     // 5. Encrypt with ChaCha20-Poly1305
     if (!chacha_encrypt(encryption_key, nonce_out, dek, KEP_KEY_SIZE,
                         encrypted_dek_out, tag_out)) {
-        hal.console->printf("KEP: ERROR - ChaCha20 encryption failed\n");
         secure_zero(shared_secret, 32);
         secure_zero(encryption_key, 32);
         return false;
@@ -626,7 +594,6 @@ bool KeyExchangeProtocol::ecies_encrypt_dek(const uint8_t peer_wk_pub[KEP_PUBKEY
     secure_zero(shared_secret, 32);
     secure_zero(encryption_key, 32);
 
-    hal.console->printf("KEP: ECIES encryption OK\n");
     return true;
 }
 
