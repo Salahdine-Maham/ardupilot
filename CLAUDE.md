@@ -133,22 +133,49 @@ Ubuntu 22.04, Python 3.10+, ArduPilot V4.7.0-dev, HSM LeMonolith v0.6
 - `KEK_HSM_Gazibo` - Gazebo testing
 - `pi-zero-bridge` - Pi Zero config WIP
 
-## Gazebo (Session 10 - EN COURS)
-```bash
-# Install plugin
-cd ~ && git clone https://github.com/ArduPilot/ardupilot_gazebo
-cd ardupilot_gazebo && mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo && make -j4
+## Gazebo + HSM (Session 11 - FONCTIONNE ✅)
 
-# Env vars
+**Plugin installé:** `~/ardupilot_gazebo/build/libArduPilotPlugin.so`
+
+**Lancer simulation:**
+```bash
+# Terminal 1: Gazebo
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$HOME/ardupilot_gazebo/build:$GZ_SIM_SYSTEM_PLUGIN_PATH
 export GZ_SIM_RESOURCE_PATH=$HOME/ardupilot_gazebo/models:$HOME/ardupilot_gazebo/worlds:$GZ_SIM_RESOURCE_PATH
+gz sim -v4 -r iris_runway.sdf
 
-# Run
-gz sim -v4 -r iris_runway.sdf  # Terminal 1
-./build/sitl/bin/arducopter -S -I0 --model gazebo-iris  # Terminal 2
+# Terminal 2: SITL (IMPORTANT: --model JSON)
+cd ~/Code_Sources/ardupilot_claude
+source venv-ardupilot/bin/activate
+python3 Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console
 ```
-Status: Gazebo Sim Harmonic 8.10.0 installé, plugin à installer
+
+**Commandes vol:**
+```
+mode guided
+arm throttle
+takeoff 5
+```
+
+**État chiffrement actuel:**
+| Direction | Status | Notes |
+|-----------|--------|-------|
+| Drone → GCS | ✅ Chiffré | MAVProxy voit `AQG\|g:oae` (garbage) |
+| GCS → Drone | ❌ Clair | MAVProxy n'a pas de DEK |
+
+**TODO:** Implémenter chiffrement GCS→Drone dans `gcs_kep_client.py`
+- Ajouté `chacha20_encrypt()` ✅
+- Besoin: wrapper pour envoyer commandes chiffrées
+
+## Encryption Status
+```
+Drone (SITL+HSM)              MAVProxy (standard)
+     │                              │
+     │◄──── Chiffré (DEK) ─────────│  ← GCS voit garbage
+     │───── Clair ────────────────►│  ← Commandes passent
+     │                              │
+```
+Pour chiffrement bidirectionnel: utiliser `gcs_kep_client.py` (en cours)
 
 ---
-**Last:** 2026-01-27 Session 9 OK - `python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120`
+**Last:** 2026-01-27 Session 11 - Gazebo+HSM OK! Drone vole avec télémétrie chiffrée. Commande: `python3 Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console`

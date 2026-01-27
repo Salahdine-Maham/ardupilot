@@ -77,6 +77,19 @@ def log(msg: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {msg}", flush=True)
 
 
+def chacha20_encrypt(key: bytes, nonce_12: bytes, plaintext: bytes, counter: int = 0) -> bytes:
+    """
+    Encrypt using ChaCha20 with 12-byte nonce (RFC 7539 style)
+    ChaCha20 is a stream cipher, so encrypt == decrypt (XOR)
+    """
+    if not CHACHA20_AVAILABLE:
+        return None
+    nonce_16 = counter.to_bytes(4, 'little') + nonce_12
+    cipher = Cipher(algorithms.ChaCha20(key, nonce_16), mode=None)
+    encryptor = cipher.encryptor()
+    return encryptor.update(plaintext)
+
+
 def chacha20_decrypt(key: bytes, nonce_12: bytes, ciphertext: bytes, counter: int = 0) -> bytes:
     """
     Decrypt using ChaCha20 with 12-byte nonce (RFC 7539 style)
