@@ -672,7 +672,7 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 | 2 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
 | 3 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
 | 4 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
-| 5 | **Câble TELEM2** | Quand reçu: désactiver Mock, brancher HSM | ⏳ Attente câble |
+| 5 | **Pi Zero Bridge** | Configurer Pi Zero comme pont Pixhawk↔HSM | ⏳ En attente matériel |
 | 6 | Multi-drone | Tester avec 2+ drones mesh | |
 | 7 | DEK rotation | Rotation de clés en vol | |
 
@@ -982,6 +982,144 @@ def _send_heartbeat(self):
 
 **Commit:** `2c13981c60` - Fix key exchange: RNG + peer reset + GCS heartbeats
 
+### Session 7: Pi Zero Bridge Architecture (2026-01-27)
+
+**Problème découvert:** Impossible de connecter directement le HSM au Pixhawk.
+
+**Configuration testée (ÉCHEC):**
+```
+Pixhawk TELEM1 (TTL) ←→ CH340G (TTL→USB) ←→ HSM ESP32 (USB-C)
+                              ↑
+                      PROBLÈME ICI!
+```
+
+**Cause:** Le convertisseur USB-TTL CH340G (xiwai) et le HSM ESP32 sont tous deux des **USB devices (esclaves)**. Deux USB devices ne peuvent pas communiquer directement - il faut un USB host.
+
+**Ports du Pixhawk5X analysés:**
+| Port | Type | Compatible USB Host? |
+|------|------|---------------------|
+| USB-C | USB Device | ❌ Non (esclave) |
+| TELEM1 | TTL Série (JST-GH 6pin) | ❌ Non |
+| TELEM2 | TTL Série (JST-GH 6pin) | ❌ Non |
+| TELEM3 | TTL Série (JST-GH 6pin) | ❌ Non |
+| GPS1/2 | TTL Série (JST-GH) | ❌ Non |
+| DEBUG | TTL Série (JST-SH) | ❌ Non |
+
+**Conclusion:** Le Pixhawk5X n'a **aucun port USB Host**. Impossible de connecter le HSM directement.
+
+---
+
+**Solution retenue: Raspberry Pi Zero comme pont**
+
+```
+┌─────────────┐         ┌─────────────────┐         ┌─────────────┐
+│  Pixhawk5X  │  TTL    │  Raspberry Pi   │   USB   │  HSM ESP32  │
+│             │ ───────►│     Zero        │────────►│             │
+│   TELEM1    │ ◄───────│  (pont série)   │◄────────│   USB-C     │
+└─────────────┘         └─────────────────┘         └─────────────┘
+     JST-GH              GPIO + USB OTG              USB-C
+```
+
+**Avantages du Pi Zero:**
+- Port USB OTG = **USB Host** capable de communiquer avec le HSM
+- GPIO UART = Communication TTL avec Pixhawk
+- Petit, léger (~9g), peu cher (~15€)
+- Peut aussi servir de companion computer
+
+---
+
+**Câblage Pixhawk TELEM1 → Pi Zero GPIO:**
+```
+Pixhawk TELEM1 (JST-GH 6pin)     Raspberry Pi Zero
+────────────────────────────     ─────────────────
+Pin 1 : +5V          ───►        Pin 2/4 : 5V (ou alim séparée)
+Pin 2 : TX           ───►        Pin 10 : GPIO15 (RX)
+Pin 3 : RX           ◄───        Pin 8  : GPIO14 (TX)
+Pin 4 : CTS          (non utilisé)
+Pin 5 : RTS          (non utilisé)
+Pin 6 : GND          ───►        Pin 6  : GND
+```
+
+**Câblage HSM → Pi Zero USB:**
+```
+HSM (USB-C) ──► Câble USB-C vers USB-A ──► Adaptateur OTG ──► Pi Zero (micro-USB)
+```
+
+---
+
+**Script pont créé:** `Tools/hsm/pi_zero_bridge.py`
+
+Fonctionnalités:
+- Détection automatique du port HSM (/dev/ttyUSB0, ttyACM0, etc.)
+- Pont bidirectionnel transparent Pixhawk ↔ HSM
+- Logs de debug avec timestamp
+- Gestion d'erreurs et reconnexion
+
+---
+
+**Checklist matériel pour Pi Zero Bridge:**
+| Item | Status |
+|------|--------|
+| Raspberry Pi Zero (W ou WH) | ⬜ |
+| Carte microSD (8GB+) | ⬜ |
+| Adaptateur micro-USB OTG (mâle→USB-A femelle) | ⬜ |
+| Câble USB-A vers USB-C (pour HSM) | ⬜ |
+| Fils Dupont femelle-femelle (3x minimum) | ⬜ |
+| Câble/adaptateur JST-GH 6pin TELEM1 vers fils | ⬜ |
+| Alimentation Pi Zero (5V micro-USB ou via Pixhawk) | ⬜ |
+
+---
+
+**Configuration Pi Zero:**
+
+```bash
+# 1. Flasher Raspberry Pi OS Lite sur microSD
+# 2. Activer SSH et WiFi dans Raspberry Pi Imager
+
+# 3. Sur le Pi Zero via SSH:
+sudo raspi-config
+# -> Interface Options -> Serial Port
+#    - Login shell over serial: NO
+#    - Serial port hardware: YES
+# -> Finish -> Reboot
+
+# 4. Installer dépendances:
+sudo apt update && sudo apt install -y python3-serial
+
+# 5. Copier le script:
+scp Tools/hsm/pi_zero_bridge.py pi@<IP_PI>:/home/pi/
+
+# 6. Lancer le pont:
+sudo python3 /home/pi/pi_zero_bridge.py
+```
+
+---
+
+**Service systemd (optionnel):**
+
+```bash
+# /etc/systemd/system/hsm-bridge.service
+[Unit]
+Description=HSM Bridge Pixhawk
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/pi_zero_bridge.py
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+
+# Activer:
+sudo systemctl enable hsm-bridge
+sudo systemctl start hsm-bridge
+```
+
+---
+
+**Prochaine étape:** Attendre le matériel (Pi Zero + câbles) pour tester.
+
 ---
 
 ## Environment
@@ -996,4 +1134,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-01-26 (Session 6) - FULL KEY EXCHANGE WORKING! Problème: uECC_make_key() échouait car RNG pas configuré. Fix: appel uECC_set_rng() + peer reset timeout 30s + GCS heartbeats. Échange bidirectionnel complet sur Pixhawk5X avec Mock HSM!
+**Last update:** 2026-01-27 (Session 7) - Pi Zero Bridge Architecture. Découverte: connexion directe HSM→Pixhawk impossible (USB device→USB device). Solution: Raspberry Pi Zero comme pont avec USB Host. Script `pi_zero_bridge.py` créé. En attente du matériel (Pi Zero + câbles JST-GH).

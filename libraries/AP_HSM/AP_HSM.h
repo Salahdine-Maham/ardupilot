@@ -9,7 +9,7 @@
 // Set to 0 to use real HSM hardware via UART
 // Use Mock for Pixhawk testing without TELEM2 cable
 #ifndef AP_HSM_MOCK_ENABLED
-#define AP_HSM_MOCK_ENABLED 1
+#define AP_HSM_MOCK_ENABLED 0
 #endif
 // =============================================================================
 

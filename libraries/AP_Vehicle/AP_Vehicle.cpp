@@ -325,7 +325,7 @@ void AP_Vehicle::setup()
     // Sur Pixhawk, l'init se fait via hsm_update() dans le scheduler (async)
     printf("HSM: === DÉBUT INIT HSM (SITL BLOQUANT) ===\n"); fflush(stdout);
     hal.console->printf("HSM: === DÉBUT INIT HSM (SITL BLOQUANT) ===\n"); ;
-    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 pour le HSM
+    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 = TELEM1 pour le HSM
     if (uart == nullptr) {
         hal.console->printf("HSM: Erreur - UART1 non disponible\n"); ;
     } else {
@@ -1255,6 +1255,9 @@ void AP_Vehicle::hsm_update()
 {
     // Wait 5 seconds before starting HSM init to ensure system is stable
     static uint32_t boot_delay_start = 0;
+    static bool hsm_uart_initialized = false;
+    static bool hsm_init_started = false;
+
     if (boot_delay_start == 0) {
         boot_delay_start = AP_HAL::millis();
     }
@@ -1264,16 +1267,39 @@ void AP_Vehicle::hsm_update()
 
     AP_HSM& hsm = AP_HSM::get_singleton();
 
+    // Step 1: Initialize UART (once)
+    if (!hsm_uart_initialized) {
+        AP_HAL::UARTDriver* uart = hal.serial(1);  // SERIAL1 = TELEM1 pour le HSM
+        if (uart == nullptr) {
+            hal.console->printf("HSM: Erreur - UART1 non disponible\n");
+            _hsm_init_done = true;
+            _hsm_ko_init_done = true;
+            return;
+        }
+        hsm.begin(uart);
+        hsm_uart_initialized = true;
+        hal.console->printf("HSM: UART1 initialisé pour HSM\n");
+        return;
+    }
+
+    // Step 2: Start async init (once)
+    if (!hsm_init_started) {
+        hal.console->printf("HSM: Démarrage init async...\n");
+        hsm.start_init_async();
+        hsm_init_started = true;
+        return;
+    }
+
     // Phase 1: Complete HSM init (async)
     if (!_hsm_init_done) {
         if (hsm.update_init()) {
             if (hsm.is_init_complete()) {
                 _hsm_init_done = true;
-                hal.console->printf("HSM: Mock init OK\n");
+                hal.console->printf("HSM: ✓ Init HSM terminée!\n");
             } else if (hsm.is_init_failed()) {
                 _hsm_init_done = true;
                 _hsm_ko_init_done = true;
-                hal.console->printf("HSM: Init FAILED\n");
+                hal.console->printf("HSM: ✗ Init FAILED\n");
             }
         }
         return;
