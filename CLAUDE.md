@@ -1285,3 +1285,53 @@ Branch: kek-HSM
 ---
 
 **Last update:** 2026-01-27 (Session 9) - TEST PIXHAWK RÉUSSI! Architecture Pixhawk (Mock HSM) + GCS (Real HSM) fonctionne. Key Exchange complet, 42 messages déchiffrés OK. Commande: `python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120`
+
+---
+
+## Session 10: Gazebo Configuration - EN COURS
+
+### Branche: `KEK_HSM_Gazibo`
+
+Créée depuis Session 9 (commit `def833a74a`)
+
+### Gazebo installé
+
+```
+Version: Gazebo Sim Harmonic 8.10.0
+Commande: gz sim
+```
+
+### Prochaines étapes
+
+1. **Installer plugin ardupilot_gazebo:**
+```bash
+cd ~
+git clone https://github.com/ArduPilot/ardupilot_gazebo
+cd ardupilot_gazebo
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo
+make -j4
+```
+
+2. **Configurer variables d'environnement:**
+```bash
+export GZ_SIM_SYSTEM_PLUGIN_PATH=$HOME/ardupilot_gazebo/build:$GZ_SIM_SYSTEM_PLUGIN_PATH
+export GZ_SIM_RESOURCE_PATH=$HOME/ardupilot_gazebo/models:$HOME/ardupilot_gazebo/worlds:$GZ_SIM_RESOURCE_PATH
+```
+
+3. **Lancer SITL avec Gazebo:**
+```bash
+# Terminal 1: Gazebo
+gz sim -v4 -r iris_runway.sdf
+
+# Terminal 2: SITL
+cd ~/ardupilot_gazebo
+./build/sitl/bin/arducopter -S -I0 --model gazebo-iris --defaults copter.parm
+```
+
+### Status
+- [x] Gazebo Sim Harmonic installé
+- [ ] Plugin ardupilot_gazebo à installer
+- [ ] Variables d'environnement à configurer
+- [ ] Test SITL + Gazebo
+- [ ] Test HSM avec Gazebo
