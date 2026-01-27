@@ -45,6 +45,8 @@ python3 -c "import serial,time;s=serial.Serial('/dev/ttyUSB0',115200,timeout=2);
 | Gazebo + Wireshark | ✅ Visualisation + capture |
 | Decrypt GCS→Drone | ✅ SET_MODE + COMMAND_LONG (Session 14) |
 | CRC Collision Fix | ✅ Decrypt même avec CRC OK (Session 14) |
+| **Test Suite** | ✅ 47/47 tests (Session 15) |
+| **MAVProxy Module** | ✅ mavproxy_hsm.py - auto encrypt/decrypt |
 
 ## Crypto Architecture
 ```
@@ -79,12 +81,17 @@ libraries/AP_HSM/
 ├── KeyOrchestrator.*       # MK+WK+DEK generation
 ├── KeyExchangeProtocol.*   # ECIES exchange
 ├── DualDekEngine.*         # Payload encryption
+libraries/GCS_MAVLink/
+├── GCS_MAVLink.cpp         # TX auto-encrypt (comm_send_buffer)
+├── GCS_Common.cpp          # RX auto-decrypt (update_receive)
 libraries/micro-ecc/uECC_config.h  # Platform auto-detect (ARM fix)
 Tools/hsm/
-├── gcs_kep_client.py       # Main GCS test client
+├── gcs_kep_client.py       # GCS test client (manual TX encrypt)
+├── mavproxy_hsm.py         # MAVProxy module (auto TX/RX encrypt)
 ├── gcs_hsm.py              # HSM Python driver
 ├── ecies.py, dual_dek_engine.py
-├── encrypted_mission.py    # Mission chiffrée automatisée (Session 13)
+├── encrypted_mission.py    # Mission chiffrée automatisée
+├── test_hsm_phase_a[1-6].py # Test suite complet (47 tests)
 ```
 
 ## Build
@@ -415,5 +422,89 @@ s.write(b'A 00A4040006010203040601\r\n')  # Test SELECT
 3. **SITL blocking init problématique** - L'init HSM bloquante cause des timeouts TCP
 4. **HSM nécessite reset multiple** - 3 cycles off/on pour état propre garanti
 
+## Session 15 - Tests Approfondis + MAVProxy Module
+
+### Tests HSM Complets: 47/47 PASSED ✅
+
+| Phase | Tests | Description | Résultat |
+|-------|-------|-------------|----------|
+| A1 | 6/6 | Communication (OFF/ON/SELECT/PIN) | ✅ |
+| A2 | 7/7 | EEPROM (WRITE 00D0, READ 00B0) | ✅ |
+| A3 | 7/7 | P-256 Asymétrique (ECDH/ECDSA) | ✅ |
+| A4 | 9/9 | Symétrique (XChaCha20-Poly1305) | ✅ |
+| A5 | 9/9 | Hiérarchie MK→WK→DEK (Dual HSM) | ✅ |
+| A6 | 9/9 | Stress (0% erreur, 2.9 ops/sec) | ✅ |
+
+**Scripts:** `Tools/hsm/test_hsm_phase_a[1-6].py`
+
+### Performance HSM Mesurée
+| Opération | Latence | Throughput |
+|-----------|---------|------------|
+| READ | ~350ms | 2.9 ops/sec |
+| WRITE | ~550ms | 1.8 ops/sec |
+| VERIFY PIN | ~550ms | - |
+| Cycle W+R | ~900ms | 1.1 ops/sec |
+
+### Découverte Critique: sim_vehicle.py = MAVProxy ⚠️
+
+`sim_vehicle.py --console --map` lance **MAVProxy au milieu**:
+```
+SITL ◄──► MAVProxy ◄──► Console/Map
+              │
+              ↓
+      Voit BAD_CRC (payload chiffré)
+      → Messages REJETÉS ou ERREURS!
+```
+
+**Solution:** Lancer SITL directement OU utiliser le module MAVProxy HSM.
+
+### Architecture Chiffrement Complète
+
+| Composant | TX (Sortant) | RX (Entrant) |
+|-----------|--------------|--------------|
+| **Drone (C++)** | ✅ AUTO `comm_send_buffer()` | ✅ AUTO `update_receive()` |
+| **GCS gcs_kep_client.py** | ⚠️ MANUEL `send_encrypted_*()` | ✅ AUTO `_try_decrypt_message()` |
+| **GCS MAVProxy+HSM** | ✅ AUTO `master_send_callback()` | ✅ AUTO `mavlink_packet()` |
+
+### Module MAVProxy HSM (Nouveau)
+
+**Fichier:** `Tools/hsm/mavproxy_hsm.py`
+
+Ajoute chiffrement automatique à MAVProxy:
+```bash
+# Dans MAVProxy
+module load Tools/hsm/mavproxy_hsm.py
+hsm init /dev/ttyUSB0
+hsm status
+```
+
+**Hooks:**
+- `mavlink_packet()` → Déchiffre RX automatiquement
+- `master_send_callback()` → Chiffre TX automatiquement
+
+**Résultat:** Console/Map voient messages en clair, trafic réseau chiffré.
+
+### Lancer SITL SANS MAVProxy (Recommandé pour HSM)
+```bash
+# Direct (pas de MAVProxy)
+./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200
+
+# Connexion GCS
+python3 Tools/hsm/gcs_kep_client.py --mavlink tcp:127.0.0.1:5760 --hsm /dev/ttyUSB3
+```
+
+### Lancer avec MAVProxy + Module HSM
+```bash
+# Terminal 1: SITL
+./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200
+
+# Terminal 2: MAVProxy avec module HSM
+mavproxy.py --master=tcp:127.0.0.1:5760 --console --map \
+  --load-module=Tools/hsm/mavproxy_hsm.py
+
+# Dans console MAVProxy:
+hsm init /dev/ttyUSB3
+```
+
 ---
-**Last:** 2026-01-27 Session 14 - Fix find_peer wildcard + Fix CRC collision. Déchiffrement bidirectionnel fonctionne quand SITL stable. Problème init HSM bloquante non résolu → tester Pixhawk.
+**Last:** 2026-01-27 Session 15 - Tests 47/47 passés. Découverte: sim_vehicle.py lance MAVProxy qui casse le chiffrement. Solution: module mavproxy_hsm.py créé.
