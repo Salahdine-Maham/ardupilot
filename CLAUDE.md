@@ -9,20 +9,62 @@ HSM LeMonolith v0.6 integration with ArduPilot for secure MAVLink communications
 
 ## Quick Start (Pour reprendre le travail)
 
+### Option 1: Test Pixhawk5X avec Mock HSM (RECOMMANDÉ)
+
+```bash
+# 1. Vérifier connexions
+ls -la /dev/ttyUSB0   # HSM LeMonolith
+ls -la /dev/ttyACM0   # Pixhawk5X
+
+# 2. Vérifier Mock HSM activé
+grep "AP_HSM_MOCK_ENABLED" libraries/AP_HSM/AP_HSM.h
+# Doit afficher: #define AP_HSM_MOCK_ENABLED 1
+
+# 3. Compiler et flasher Pixhawk
+./waf configure --board Pixhawk5X
+./waf copter
+./waf --upload copter
+
+# 4. Lancer le test GCS avec Real HSM
+python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120
+
+# Résultat attendu:
+#   Peer 1: state=COMPLETE wk_recv=True dek_recv=True
+#   Decrypted OK: 42+
+```
+
+### Option 2: Test SITL avec Real HSM
+
 ```bash
 # 1. Vérifier HSM connecté
 ls -la /dev/ttyUSB0
 
-# 2. Compiler
-cd /home/samwitwity/Code_Sources/ardupilot_claude
+# 2. Compiler SITL
 ./waf configure --board sitl && ./waf copter
 
-# 3. Test rapide Feature 3
+# 3. Lancer SITL avec HSM
 stdbuf -oL ./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200 &
-sleep 3
+sleep 35  # Attendre init HSM (~25s)
+
+# 4. Test GCS (sans HSM local car SITL utilise le HSM)
 python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 60
 
 # Résultat attendu: "KEY EXCHANGE COMPLETE!"
+```
+
+### Dépannage HSM
+
+```bash
+# Si HSM envoie du garbage, débrancher/rebrancher USB puis:
+python3 << 'EOF'
+import serial, time
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=2)
+ser.write(b'off\r\n'); time.sleep(0.5)
+ser.write(b'on\r\n'); time.sleep(4)
+ser.write(b'A 00A4040006010203040601\r\n'); time.sleep(1.5)
+print('OK!' if b'9000' in ser.read(500) else 'ERROR - rebrancher HSM')
+ser.close()
+EOF
 ```
 
 ---
@@ -1118,7 +1160,115 @@ sudo systemctl start hsm-bridge
 
 ---
 
-**Prochaine étape:** Attendre le matériel (Pi Zero + câbles) pour tester.
+**Prochaine étape:** Continuer tests multi-drone ou attendre Pi Zero pour connexion directe.
+
+---
+
+## Session 9: Test Pixhawk Mock HSM - SUCCÈS! ✅ (2026-01-27)
+
+### Architecture testée
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   PIXHAWK 5X                           PC (GCS)                         │
+│   ┌─────────────────┐                  ┌─────────────────┐             │
+│   │  ArduCopter     │    USB/Radio     │  gcs_kep_client │             │
+│   │  + KEP + DDE    │◄────────────────►│                 │             │
+│   └────────┬────────┘   /dev/ttyACM0   └────────┬────────┘             │
+│            │                                     │                      │
+│   ┌────────▼────────┐                  ┌────────▼────────┐             │
+│   │   MOCK HSM      │                  │   REAL HSM      │             │
+│   │   (RAM)         │                  │  /dev/ttyUSB0   │             │
+│   │   Instantané    │                  │  LeMonolith     │             │
+│   └─────────────────┘                  └─────────────────┘             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Commandes de test
+
+```bash
+# 1. Vérifier Mock HSM activé
+grep "AP_HSM_MOCK_ENABLED" libraries/AP_HSM/AP_HSM.h
+# → #define AP_HSM_MOCK_ENABLED 1
+
+# 2. Compiler et flasher
+./waf configure --board Pixhawk5X
+./waf copter
+./waf --upload copter
+
+# 3. Vérifier ports
+ls -la /dev/ttyACM0  # Pixhawk
+ls -la /dev/ttyUSB0  # HSM
+
+# 4. Lancer test (PARAMÈTRES IMPORTANTS!)
+python3 Tools/hsm/gcs_kep_client.py \
+    --mavlink /dev/ttyACM0 \
+    --hsm /dev/ttyUSB0 \
+    --timeout 120
+```
+
+### Résultats du test
+
+```
+============================================================
+  GCS Key Exchange Protocol Client
+============================================================
+  MAVLink: /dev/ttyACM0
+  HSM Port: /dev/ttyUSB0
+  GCS ID: sysid=255 compid=190
+============================================================
+
+[04:53:24] [INFO] Starting GCS KEP Client...
+[04:53:24] [INFO] Initializing HSM...
+[GCS_HSM] HSM initialise avec succes
+[GCS_HSM] === Mission Keys OK ===
+[GCS_HSM]   Temps: 10962 ms
+[04:53:35] [INFO] Connected to system 1 component 0
+[KEP] WK public initialized: f983da53077886bb...
+
+==================================================
+FINAL STATUS
+==================================================
+GCS sysid: 255
+WK public ready: True
+Peers: 1
+  Peer 1: state=COMPLETE wk_recv=True dek_recv=True  ✅
+Peer DEKs stored: 1
+  sysid=1: 6c41431d...
+
+DualDekEngine Status:
+  Ready: YES  ✅
+  Peers with DEK: [1]
+  TX encrypted: 0
+  RX decrypted: 0
+  RX failed: 0
+
+Crypto Statistics:
+  Encrypted received: 42
+  Decrypted OK: 42  ✅
+  Decrypted FAIL: 0
+==================================================
+```
+
+### Paramètres clés
+
+| Paramètre | Valeur | Description |
+|-----------|--------|-------------|
+| `--mavlink` | `/dev/ttyACM0` | Port USB Pixhawk |
+| `--hsm` | `/dev/ttyUSB0` | Port USB HSM LeMonolith |
+| `--timeout` | `120` | Timeout en secondes |
+| `--no-hsm` | (flag) | Mode sans HSM (pour SITL) |
+| `--verbose` | (flag) | Logs détaillés |
+
+### Problèmes résolus cette session
+
+| Problème | Solution |
+|----------|----------|
+| HSM envoie garbage | Débrancher/rebrancher USB physiquement |
+| "Connection refused" | Utiliser `--mavlink /dev/ttyACM0` (pas TCP) |
+| Mock HSM désactivé | Restaurer `AP_HSM_MOCK_ENABLED 1` |
 
 ---
 
@@ -1134,4 +1284,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-01-27 (Session 7) - Pi Zero Bridge Architecture. Découverte: connexion directe HSM→Pixhawk impossible (USB device→USB device). Solution: Raspberry Pi Zero comme pont avec USB Host. Script `pi_zero_bridge.py` créé. En attente du matériel (Pi Zero + câbles JST-GH).
+**Last update:** 2026-01-27 (Session 9) - TEST PIXHAWK RÉUSSI! Architecture Pixhawk (Mock HSM) + GCS (Real HSM) fonctionne. Key Exchange complet, 42 messages déchiffrés OK. Commande: `python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120`
