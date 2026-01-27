@@ -1895,6 +1895,13 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
     status.packet_rx_drop_count = 0;
 
     const uint16_t nbytes = _port->available();
+
+    // DEBUG: Check bytes available on each channel
+    static uint32_t bytes_check = 0;
+    if (nbytes > 0 || (++bytes_check <= 5)) {
+        fprintf(stderr, "CHAN%u: nbytes=%u locked=%d\n", chan, nbytes, locked());
+        fflush(stderr);
+    }
     for (uint16_t i=0; i<nbytes; i++)
     {
         uint8_t c = (uint8_t)_port->read();
@@ -1926,7 +1933,70 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
 
         // Try to get a new message
         const uint8_t framing = mavlink_frame_char_buffer(channel_buffer(), channel_status(), c, &msg, &status);
+
+        // DEBUG: Log framing status for non-incomplete frames
+        if (framing != MAVLINK_FRAMING_INCOMPLETE) {
+            static uint32_t frame_count = 0;
+            frame_count++;
+            // Always log: first 20, BAD_CRC frames, SET_MODE (11), COMMAND_LONG (76), or every 200th
+            bool should_log = (frame_count <= 20 || frame_count % 200 == 0 ||
+                               framing == MAVLINK_FRAMING_BAD_CRC ||
+                               msg.msgid == 11 || msg.msgid == 76);
+            if (should_log) {
+                fprintf(stderr, "FRAME_DEBUG: framing=%u msgid=%u sysid=%u len=%u magic=%02X ck_a=%02X ck_b=%02X (count=%lu)\n",
+                       framing, msg.msgid, msg.sysid, msg.len, msg.magic,
+                       msg.checksum & 0xFF, (msg.checksum >> 8) & 0xFF,
+                       (unsigned long)frame_count);
+                fflush(stderr);
+            }
+        }
+
         if (framing == MAVLINK_FRAMING_OK) {
+#if AP_HSM_ENABLED
+            // Check if this message should be decrypted despite CRC OK (CRC collision case)
+            // Messages from encrypted peers (except plaintext protocol messages) need decryption
+            const bool is_plaintext_msg = (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_WK_EXCHANGE ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_DEK_EXCHANGE ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_KEY_ACK);
+            KeyExchangeProtocol* kep_ok = KeyExchangeProtocol::get_singleton();
+            const uint8_t* peer_dek_ok = (kep_ok != nullptr && gcs().get_mav_encrypt() != 0) ?
+                                          kep_ok->get_peer_dek(msg.sysid, 0) : nullptr;
+
+            // If we have a DEK for this peer and it's not a plaintext message, decrypt it
+            // This handles CRC collision cases where encrypted payload happens to have valid CRC
+            if (peer_dek_ok != nullptr && !is_plaintext_msg && msg.len > 0) {
+                // CRC collision - need to decrypt despite FRAMING_OK
+                fprintf(stderr, "CRC_COLLISION: msgid=%u sysid=%u - decrypting despite valid CRC\n",
+                       msg.msgid, msg.sysid);
+                fflush(stderr);
+
+                // Build nonce
+                uint8_t nonce_ok[12];
+                nonce_ok[0] = msg.seq;
+                nonce_ok[1] = msg.sysid;
+                nonce_ok[2] = msg.compid;
+                nonce_ok[3] = (msg.msgid >> 0) & 0xFF;
+                nonce_ok[4] = (msg.msgid >> 8) & 0xFF;
+                nonce_ok[5] = (msg.msgid >> 16) & 0xFF;
+                nonce_ok[6] = chan;
+                nonce_ok[7] = 0x00;
+                nonce_ok[8] = 0x00;
+                nonce_ok[9] = 0x00;
+                nonce_ok[10] = 0x00;
+                nonce_ok[11] = 0x00;
+
+                // Decrypt in-place
+                uint8_t decrypted_ok[MAVLINK_MAX_PAYLOAD_LEN];
+                ChaCha20XOR((uint8_t*)peer_dek_ok, 0, nonce_ok, (uint8_t*)msg.payload64, decrypted_ok, msg.len);
+                memcpy((void*)msg.payload64, decrypted_ok, msg.len);
+
+                static uint32_t crc_collision_count = 0;
+                fprintf(stderr, "DECRYPT_OK (CRC collision): msg %u from sysid=%u (%u bytes) count=%lu\n",
+                       msg.msgid, msg.sysid, msg.len, (unsigned long)++crc_collision_count);
+                fflush(stderr);
+            }
+#endif
             hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
             packetReceived(status, msg);
             parsed_packet = true;
@@ -1938,13 +2008,47 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
 #if AP_HSM_ENABLED
         else if (framing == MAVLINK_FRAMING_BAD_CRC && gcs().get_mav_encrypt() != 0) {
             // Feature 3: CRC fails because payload was encrypted
-            // Decrypt and process the message anyway
-            KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+            // But skip decryption for plaintext messages (HEARTBEAT, HSM_* protocol messages)
+            const bool is_plaintext_msg = (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_WK_EXCHANGE ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_DEK_EXCHANGE ||
+                                           msg.msgid == MAVLINK_MSG_ID_HSM_KEY_ACK);
 
-            // Get peer DEK based on source sysid
-            const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
+            if (is_plaintext_msg) {
+                // Process plaintext messages directly without decryption
+                static uint32_t plaintext_count = 0;
+                if (++plaintext_count <= 10 || plaintext_count % 100 == 0) {
+                    fprintf(stderr, "HSM: Plaintext msg %u from sysid=%u (no decrypt)\n",
+                           msg.msgid, msg.sysid);
+                    fflush(stderr);
+                }
+                hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
+                packetReceived(status, msg);
+                parsed_packet = true;
+                gcs_alternative_active[chan] = false;
+                alternative.last_mavlink_ms = now_ms;
+                hal.util->persistent_data.last_mavlink_msgid = 0;
+            } else {
+                // Decrypt encrypted messages
+                KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
 
-            if (peer_dek != nullptr && msg.len > 0) {
+                // Get peer DEK based on source sysid
+                const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
+
+                // DEBUG: Show decrypt attempt
+                static uint32_t decrypt_attempt = 0;
+                if (++decrypt_attempt <= 20) {
+                    fprintf(stderr, "DECRYPT_DEBUG: msgid=%u sysid=%u len=%u peer_dek=%s\n",
+                           msg.msgid, msg.sysid, msg.len, peer_dek ? "YES" : "NO");
+                    if (peer_dek) {
+                        fprintf(stderr, "DECRYPT_DEBUG: peer_dek[0:8]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                               peer_dek[0], peer_dek[1], peer_dek[2], peer_dek[3],
+                               peer_dek[4], peer_dek[5], peer_dek[6], peer_dek[7]);
+                    }
+                    fflush(stderr);
+                }
+
+                if (peer_dek != nullptr && msg.len > 0) {
                 // Nonce déterministe basé sur les champs du message
                 // Utilise seq + sysid + compid + msgid pour synchronisation
                 uint8_t nonce[12];
@@ -1961,6 +2065,14 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
                 nonce[10] = 0x00;
                 nonce[11] = 0x00;
 
+                // DEBUG: Show nonce
+                if (decrypt_attempt <= 20) {
+                    fprintf(stderr, "DECRYPT_DEBUG: nonce=%02x%02x%02x%02x%02x%02x (seq=%u sysid=%u compid=%u msgid=%u chan=%u)\n",
+                           nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5],
+                           msg.seq, msg.sysid, msg.compid, msg.msgid, chan);
+                    fflush(stderr);
+                }
+
                 // Décrypter le payload in-place
                 uint8_t decrypted[MAVLINK_MAX_PAYLOAD_LEN];
                 ChaCha20XOR((uint8_t*)peer_dek, 0, nonce, (uint8_t*)msg.payload64, decrypted, msg.len);
@@ -1968,9 +2080,10 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
 
                 // Debug périodique
                 static uint32_t rx_decrypt_count = 0;
-                if (++rx_decrypt_count % 50 == 1) {
-                    hal.console->printf("DDE-RX: Decrypted msg %u from sysid=%u (%u bytes)\n",
-                           msg.msgid, msg.sysid, msg.len);
+                if (++rx_decrypt_count <= 10 || rx_decrypt_count % 50 == 1) {
+                    fprintf(stderr, "DECRYPT_OK: msg %u from sysid=%u (%u bytes) count=%lu\n",
+                           msg.msgid, msg.sysid, msg.len, (unsigned long)rx_decrypt_count);
+                    fflush(stderr);
                 }
 
                 // Process the decrypted message
@@ -1988,6 +2101,7 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
                     no_dek_warn_count++;
                 }
             }
+            }  // end else (encrypted messages)
         }
 #endif // AP_HSM_ENABLED
 #if AP_SCRIPTING_ENABLED
@@ -2798,6 +2912,13 @@ void GCS::update_send()
 
 void GCS::update_receive(void)
 {
+    // DEBUG: Check if update_receive is called - use fprintf to stderr for immediate output
+    static uint32_t update_count = 0;
+    if (++update_count <= 5 || update_count % 1000 == 0) {
+        fprintf(stderr, "UPDATE_RECV: num_gcs=%u count=%lu\n", num_gcs(), (unsigned long)update_count);
+        fflush(stderr);
+    }
+
     for (uint8_t i=0; i<num_gcs(); i++) {
         chan(i)->update_receive();
     }
@@ -4326,6 +4447,16 @@ void GCS_MAVLINK::handle_heartbeat(const mavlink_message_t &msg) const
  */
 void GCS_MAVLINK::handle_message(const mavlink_message_t &msg)
 {
+    // DEBUG: Log all incoming messages from external sources
+    static uint32_t msg_count = 0;
+    if (msg.sysid != 1) {  // Not from us
+        if (++msg_count <= 10 || msg_count % 100 == 0) {
+            fprintf(stderr, "RX_DEBUG: msgid=%u from sysid=%u compid=%u (count=%lu)\n",
+                   msg.msgid, msg.sysid, msg.compid, (unsigned long)msg_count);
+            fflush(stderr);
+        }
+    }
+
     switch (msg.msgid) {
 
     case MAVLINK_MSG_ID_HEARTBEAT: {

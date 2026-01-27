@@ -95,8 +95,11 @@ bool KeyExchangeProtocol::init(KeyOrchestrator* key_orch)
 KeyExchangeProtocol::PeerInfo* KeyExchangeProtocol::find_peer(uint8_t sysid, uint8_t compid)
 {
     for (uint8_t i = 0; i < KEP_MAX_PEERS; i++) {
-        if (_peers[i].active && _peers[i].sysid == sysid && _peers[i].compid == compid) {
-            return &_peers[i];
+        if (_peers[i].active && _peers[i].sysid == sysid) {
+            // compid=0 means "match any compid" (wildcard)
+            if (compid == 0 || _peers[i].compid == compid) {
+                return &_peers[i];
+            }
         }
     }
     return nullptr;

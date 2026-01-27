@@ -162,6 +162,7 @@ def build_nonce_12(seq: int, sysid: int, compid: int, msgid: int, chan: int = 0,
 MAVLINK_MSG_NAMES = {
     0: "HEARTBEAT",
     1: "SYS_STATUS",
+    11: "SET_MODE",
     24: "GPS_RAW_INT",
     30: "ATTITUDE",
     33: "GLOBAL_POSITION_INT",
@@ -176,6 +177,23 @@ MAVLINK_MSG_NAMES = {
     12001: "HSM_DEK_EXCHANGE",
     12002: "HSM_KEY_ACK",
 }
+
+# Common MAV_CMD constants for encrypted commands
+MAV_CMD_NAV_TAKEOFF = 22
+MAV_CMD_NAV_LAND = 21
+MAV_CMD_NAV_RETURN_TO_LAUNCH = 20
+MAV_CMD_COMPONENT_ARM_DISARM = 400
+MAV_CMD_DO_SET_MODE = 176
+
+# Copter flight modes
+COPTER_MODE_STABILIZE = 0
+COPTER_MODE_ACRO = 1
+COPTER_MODE_ALT_HOLD = 2
+COPTER_MODE_AUTO = 3
+COPTER_MODE_GUIDED = 4
+COPTER_MODE_LOITER = 5
+COPTER_MODE_RTL = 6
+COPTER_MODE_LAND = 9
 
 
 class MockHSM:
@@ -301,11 +319,17 @@ class GCSKeyExchangeClient:
             self._log("SITL mode: Connection will trigger HSM init (~25s blocking)")
 
         try:
+            # Force MAVLink v2 for compatibility with ArduPilot HSM
+            import os
+            os.environ['MAVLINK20'] = '1'
             self.mav = mavutil.mavlink_connection(
                 self.mavlink_connection_str,
                 source_system=self.gcs_sysid,
-                source_component=self.gcs_compid
+                source_component=self.gcs_compid,
+                dialect='ardupilotmega'
             )
+            # Ensure MAVLink v2 is used
+            self.mav.mav.robust_parsing = True
         except Exception as e:
             self._log(f"MAVLink connection failed: {e}", "ERROR")
             return False
@@ -468,22 +492,210 @@ class GCSKeyExchangeClient:
         self._log("WARNING: Raw message sending not implemented", "WARN")
 
     def _send_heartbeat(self):
-        """Send a heartbeat message to announce our presence"""
+        """Send a heartbeat message to announce our presence using MAVLink v2"""
         try:
-            # GCS type: MAV_TYPE_GCS = 6
-            # Autopilot: MAV_AUTOPILOT_INVALID = 8 (for GCS)
-            # Base mode: 0
-            # Custom mode: 0
-            # System status: MAV_STATE_ACTIVE = 4
-            self.mav.mav.heartbeat_send(
-                6,   # type: MAV_TYPE_GCS
-                8,   # autopilot: MAV_AUTOPILOT_INVALID
-                0,   # base_mode
-                0,   # custom_mode
-                4    # system_status: MAV_STATE_ACTIVE
-            )
+            # Use our HSM dialect (MAVLink v2) instead of pymavlink default (v1)
+            if self.mav_hsm:
+                # Create heartbeat using our v2 dialect
+                msg = self.mav_hsm.heartbeat_encode(
+                    6,   # type: MAV_TYPE_GCS
+                    8,   # autopilot: MAV_AUTOPILOT_INVALID
+                    0,   # base_mode
+                    0,   # custom_mode
+                    4    # system_status: MAV_STATE_ACTIVE
+                )
+                # Pack and send with v2 format
+                packed = msg.pack(self.mav_hsm)
+                self.mav.write(packed)
+            else:
+                # Fallback to pymavlink (may be v1)
+                self.mav.mav.heartbeat_send(
+                    6,   # type: MAV_TYPE_GCS
+                    8,   # autopilot: MAV_AUTOPILOT_INVALID
+                    0,   # base_mode
+                    0,   # custom_mode
+                    4    # system_status: MAV_STATE_ACTIVE
+                )
         except Exception as e:
             self._log(f"Failed to send heartbeat: {e}", "DEBUG")
+
+    def _get_next_seq(self) -> int:
+        """Get next sequence number for outgoing messages"""
+        if not hasattr(self, '_tx_seq'):
+            self._tx_seq = 0
+        self._tx_seq = (self._tx_seq + 1) % 256
+        return self._tx_seq
+
+    def _encrypt_and_send_raw(self, msgid: int, payload: bytes, target_sysid: int) -> bool:
+        """
+        Encrypt a MAVLink payload and send it as raw bytes.
+
+        Args:
+            msgid: MAVLink message ID
+            payload: Original plaintext payload
+            target_sysid: Target system ID (to get peer DEK for encryption)
+
+        Returns:
+            True if sent successfully
+        """
+        if not self.exchange_complete:
+            self._log("Cannot encrypt: key exchange not complete", "WARN")
+            return False
+
+        if not CHACHA20_AVAILABLE:
+            self._log("Cannot encrypt: ChaCha20 not available", "ERROR")
+            return False
+
+        # Get MY DEK (we encrypt with OUR key, drone decrypts with peer DEK)
+        my_dek = None
+        if self.hsm:
+            my_dek = self.hsm.get_my_dek()
+
+        if my_dek is None:
+            self._log("Cannot encrypt: MY_DEK not available", "ERROR")
+            return False
+
+        # DEBUG: Show MY_DEK being used
+        self._log(f"[ENCRYPT DEBUG] MY_DEK: {my_dek[:8].hex()}...")
+
+        # Build nonce (must match drone's RX nonce reconstruction)
+        seq = self._get_next_seq()
+        nonce = build_nonce_12(seq, self.gcs_sysid, self.gcs_compid, msgid, chan=0, direction=0)
+
+        # DEBUG: Show nonce
+        self._log(f"[ENCRYPT DEBUG] nonce: seq={seq} sysid={self.gcs_sysid} compid={self.gcs_compid} msgid={msgid}")
+        self._log(f"[ENCRYPT DEBUG] nonce bytes: {nonce.hex()}")
+
+        # Encrypt payload
+        encrypted_payload = chacha20_encrypt(my_dek, nonce, payload, counter=0)
+        if encrypted_payload is None:
+            self._log("Encryption failed", "ERROR")
+            return False
+
+        # DEBUG: Show plaintext vs encrypted
+        self._log(f"[ENCRYPT DEBUG] plaintext[0:8]: {payload[:8].hex() if len(payload) >= 8 else payload.hex()}")
+        self._log(f"[ENCRYPT DEBUG] encrypted[0:8]: {encrypted_payload[:8].hex() if len(encrypted_payload) >= 8 else encrypted_payload.hex()}")
+
+        # Build MAVLink v2 frame
+        # STX(1) + Len(1) + Incompat(1) + Compat(1) + Seq(1) + SysID(1) + CompID(1) + MsgID(3) + Payload + CRC(2)
+        frame = bytearray()
+        frame.append(0xFD)  # STX MAVLink v2
+        frame.append(len(encrypted_payload))  # Payload length
+        frame.append(0x00)  # Incompat flags
+        frame.append(0x00)  # Compat flags
+        frame.append(seq)   # Sequence
+        frame.append(self.gcs_sysid)  # Source sysid
+        frame.append(self.gcs_compid)  # Source compid
+        frame.append(msgid & 0xFF)  # MsgID low
+        frame.append((msgid >> 8) & 0xFF)  # MsgID mid
+        frame.append((msgid >> 16) & 0xFF)  # MsgID high
+        frame.extend(encrypted_payload)
+
+        # Calculate CRC (on encrypted payload - will fail on drone side, triggering decrypt)
+        crc = self._mavlink_crc(bytes(frame[1:]), msgid)
+        frame.append(crc & 0xFF)
+        frame.append((crc >> 8) & 0xFF)
+
+        # Send raw frame
+        try:
+            self.mav.write(bytes(frame))
+            if self.verbose:
+                self._log(f"[TX ENCRYPTED] msgid={msgid} seq={seq} len={len(encrypted_payload)}")
+            return True
+        except Exception as e:
+            self._log(f"Failed to send encrypted message: {e}", "ERROR")
+            return False
+
+    def _mavlink_crc(self, data: bytes, msgid: int) -> int:
+        """
+        Calculate MAVLink CRC-16/MCRF4XX with CRC extra byte.
+
+        Note: This CRC is computed on encrypted payload, so it will fail
+        on the receiving end, triggering the decrypt path.
+        """
+        # CRC extra bytes for common messages (from pymavlink)
+        CRC_EXTRA = {
+            0: 50,    # HEARTBEAT
+            1: 124,   # SYS_STATUS
+            24: 24,   # GPS_RAW_INT
+            30: 39,   # ATTITUDE
+            33: 104,  # GLOBAL_POSITION_INT
+            74: 20,   # VFR_HUD
+            76: 152,  # COMMAND_LONG
+            77: 143,  # COMMAND_ACK
+            253: 83,  # STATUSTEXT
+        }
+
+        crc = 0xFFFF
+        for byte in data:
+            tmp = byte ^ (crc & 0xFF)
+            tmp ^= (tmp << 4) & 0xFF
+            crc = (crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)
+            crc &= 0xFFFF
+
+        # Add CRC extra
+        extra = CRC_EXTRA.get(msgid, 0)
+        tmp = extra ^ (crc & 0xFF)
+        tmp ^= (tmp << 4) & 0xFF
+        crc = (crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)
+        crc &= 0xFFFF
+
+        return crc
+
+    def send_encrypted_command(self, command: int, param1: float = 0, param2: float = 0,
+                               param3: float = 0, param4: float = 0, param5: float = 0,
+                               param6: float = 0, param7: float = 0,
+                               target_sysid: int = 1, target_compid: int = 0,
+                               confirmation: int = 0) -> bool:
+        """
+        Send an encrypted COMMAND_LONG message to the drone.
+
+        Args:
+            command: MAV_CMD_* command ID
+            param1-7: Command parameters
+            target_sysid: Target system ID (default: 1 = drone)
+            target_compid: Target component ID (default: 0 = autopilot)
+            confirmation: Confirmation count
+
+        Returns:
+            True if sent successfully
+
+        Example:
+            # ARM the drone (encrypted)
+            client.send_encrypted_command(400, param1=1)  # MAV_CMD_COMPONENT_ARM_DISARM
+
+            # TAKEOFF to 5m (encrypted)
+            client.send_encrypted_command(22, param7=5)   # MAV_CMD_NAV_TAKEOFF
+        """
+        # COMMAND_LONG payload format (33 bytes):
+        # param1(4) + param2(4) + param3(4) + param4(4) + param5(4) + param6(4) + param7(4) +
+        # command(2) + target_system(1) + target_component(1) + confirmation(1)
+        payload = struct.pack('<fffffffHBBB',
+                              param1, param2, param3, param4, param5, param6, param7,
+                              command, target_sysid, target_compid, confirmation)
+
+        self._log(f"[TX] Sending encrypted COMMAND_LONG: cmd={command} to sysid={target_sysid}")
+        return self._encrypt_and_send_raw(76, payload, target_sysid)  # 76 = COMMAND_LONG
+
+    def send_encrypted_set_mode(self, base_mode: int, custom_mode: int,
+                                target_sysid: int = 1) -> bool:
+        """
+        Send encrypted SET_MODE command.
+
+        Args:
+            base_mode: MAV_MODE flags
+            custom_mode: Autopilot-specific mode
+            target_sysid: Target system ID
+
+        Example:
+            # Set GUIDED mode (custom_mode=4 for Copter)
+            client.send_encrypted_set_mode(base_mode=1, custom_mode=4)
+        """
+        # SET_MODE payload (6 bytes): custom_mode(4) + target_system(1) + base_mode(1)
+        payload = struct.pack('<IBB', custom_mode, target_sysid, base_mode)
+
+        self._log(f"[TX] Sending encrypted SET_MODE: base={base_mode} custom={custom_mode}")
+        return self._encrypt_and_send_raw(11, payload, target_sysid)  # 11 = SET_MODE
 
     def handle_message(self, msg):
         """Handle incoming MAVLink message"""
@@ -972,6 +1184,111 @@ class GCSKeyExchangeClient:
         if self.hsm:
             self.hsm.disconnect()
 
+    def interactive_mode(self):
+        """
+        Interactive mode to send encrypted commands after key exchange.
+
+        Commands:
+            arm       - Arm the drone (encrypted)
+            disarm    - Disarm the drone (encrypted)
+            takeoff N - Takeoff to N meters (encrypted)
+            land      - Land (encrypted)
+            rtl       - Return to launch (encrypted)
+            guided    - Set GUIDED mode (encrypted)
+            loiter    - Set LOITER mode (encrypted)
+            status    - Show crypto statistics
+            quit      - Exit interactive mode
+        """
+        self._log("")
+        self._log("=" * 60)
+        self._log("  INTERACTIVE MODE - Encrypted Commands")
+        self._log("=" * 60)
+        self._log("Commands:")
+        self._log("  arm       - Arm the drone")
+        self._log("  disarm    - Disarm the drone")
+        self._log("  takeoff N - Takeoff to N meters (e.g., 'takeoff 5')")
+        self._log("  land      - Land")
+        self._log("  rtl       - Return to launch")
+        self._log("  guided    - Set GUIDED mode")
+        self._log("  loiter    - Set LOITER mode")
+        self._log("  status    - Show crypto statistics")
+        self._log("  quit      - Exit")
+        self._log("=" * 60)
+        self._log("")
+
+        while self.running:
+            try:
+                # Non-blocking receive to keep processing messages
+                msg = self.mav.recv_match(blocking=False)
+                if msg:
+                    self.handle_message(msg)
+
+                # Check for user input (with timeout)
+                import select
+                import sys
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    line = sys.stdin.readline().strip().lower()
+                    if not line:
+                        continue
+
+                    parts = line.split()
+                    cmd = parts[0]
+
+                    if cmd == 'quit' or cmd == 'q':
+                        self._log("Exiting interactive mode...")
+                        break
+
+                    elif cmd == 'arm':
+                        self._log("Sending encrypted ARM command...")
+                        self.send_encrypted_command(MAV_CMD_COMPONENT_ARM_DISARM, param1=1)
+
+                    elif cmd == 'disarm':
+                        self._log("Sending encrypted DISARM command...")
+                        self.send_encrypted_command(MAV_CMD_COMPONENT_ARM_DISARM, param1=0)
+
+                    elif cmd == 'takeoff':
+                        alt = float(parts[1]) if len(parts) > 1 else 5.0
+                        self._log(f"Sending encrypted TAKEOFF to {alt}m...")
+                        self.send_encrypted_command(MAV_CMD_NAV_TAKEOFF, param7=alt)
+
+                    elif cmd == 'land':
+                        self._log("Sending encrypted LAND command...")
+                        self.send_encrypted_command(MAV_CMD_NAV_LAND)
+
+                    elif cmd == 'rtl':
+                        self._log("Sending encrypted RTL command...")
+                        self.send_encrypted_command(MAV_CMD_NAV_RETURN_TO_LAUNCH)
+
+                    elif cmd == 'guided':
+                        self._log("Sending encrypted GUIDED mode...")
+                        self.send_encrypted_set_mode(base_mode=1, custom_mode=COPTER_MODE_GUIDED)
+
+                    elif cmd == 'loiter':
+                        self._log("Sending encrypted LOITER mode...")
+                        self.send_encrypted_set_mode(base_mode=1, custom_mode=COPTER_MODE_LOITER)
+
+                    elif cmd == 'status':
+                        self._log("")
+                        self._log("Crypto Statistics:")
+                        self._log(f"  Encrypted received: {self._crypto_stats['encrypted_received']}")
+                        self._log(f"  Decrypted OK: {self._crypto_stats['decrypted_ok']}")
+                        self._log(f"  Decrypted FAIL: {self._crypto_stats['decrypted_fail']}")
+                        self._log("")
+
+                    else:
+                        self._log(f"Unknown command: {cmd}", "WARN")
+
+                # Send periodic heartbeat
+                if not hasattr(self, '_last_hb') or time.time() - self._last_hb >= 1.0:
+                    self._send_heartbeat()
+                    self._last_hb = time.time()
+
+            except KeyboardInterrupt:
+                self._log("Interrupted...")
+                break
+            except Exception as e:
+                self._log(f"Error: {e}", "ERROR")
+
 
 def main():
     parser = argparse.ArgumentParser(description='GCS Key Exchange Protocol Client')
@@ -993,6 +1310,8 @@ def main():
                        help='Skip SITL HSM init trigger (use when HSM already initialized)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Verbose logging of encrypted/decrypted payloads')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                       help='Enter interactive mode after key exchange (send encrypted commands)')
 
     args = parser.parse_args()
 
@@ -1007,6 +1326,7 @@ def main():
     print(f"  HSM Port: {args.hsm}")
     print(f"  GCS ID: sysid={args.sysid} compid={args.compid}")
     print(f"  Verbose: {args.verbose}")
+    print(f"  Interactive: {args.interactive}")
     print("=" * 60)
     print()
 
@@ -1025,6 +1345,10 @@ def main():
     client.init_hsm = init_hsm_with_options
 
     success = client.run(timeout=args.timeout, trigger_hsm_init=not args.no_trigger)
+
+    # If key exchange succeeded and interactive mode requested, enter interactive mode
+    if success and args.interactive:
+        client.interactive_mode()
 
     sys.exit(0 if success else 1)
 
