@@ -173,15 +173,6 @@ class E2ETestSuite:
     def send_encrypted_command(self, command: int, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0) -> bool:
         """Send an encrypted COMMAND_LONG"""
         try:
-            # Build COMMAND_LONG payload
-            payload = struct.pack('<HBBBBBBfffffff',
-                                  self.mav.target_system,  # target_system
-                                  self.mav.target_component,  # target_component
-                                  command,  # command
-                                  0,  # confirmation
-                                  0, 0, 0, 0,  # padding
-                                  p1, p2, p3, p4, p5, p6, p7)
-
             # Note: Actual encryption would happen here
             # For testing, we send plaintext commands
             self.mav.mav.command_long_send(
