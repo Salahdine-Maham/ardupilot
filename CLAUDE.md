@@ -82,7 +82,7 @@ EOF
 
 ---
 
-## Feature Status (2026-01-26)
+## Feature Status (2026-02-04)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -90,9 +90,95 @@ EOF
 | 2.1: KeyOrchestrator | ✅ DONE | MK+WK+DEK stored in HSM |
 | 2.2: Key Exchange Protocol | ✅ DONE | Full ECIES crypto on SITL + Pixhawk |
 | 3: Dual-DEK Engine | ✅ DONE | TX/RX encryption, deterministic nonce |
+| **3.1: CRC Fix** | ✅ DONE | Session 22 - Recalculer CRC sur ciphertext |
 | **Mock HSM** | ✅ DONE | Test Pixhawk sans câble TELEM2 |
 | **Pixhawk KEP** | ✅ DONE | Full bidirectional exchange - Session 6 |
 | **Peer Reset** | ✅ DONE | 30s timeout allows re-exchange without reboot |
+| **HSM avant TCP** | ❌ ABANDONNÉ | Session 10 - Impossible sans modifier HAL |
+| **KEP Test Framework** | ✅ DONE | 27 tests bidirectionnels - Session 11 |
+
+---
+
+## Session 10: Analyse HSM Init vs TCP (2026-02-03)
+
+### Objectif Initial
+Déplacer l'initialisation HSM **AVANT** la connexion TCP pour permettre l'utilisation d'un **VRAI HSM** en SITL.
+
+### Découverte Importante
+
+**Le TCP bind/accept ne se fait PAS dans `serial_manager.init_console()` !**
+
+L'initialisation TCP se fait dans `HAL_SITL_Class.cpp:run()` AVANT que `setup()` soit appelé:
+
+```cpp
+// libraries/AP_HAL_SITL/HAL_SITL_Class.cpp:214-250
+void HAL_SITL::run(...) const
+{
+    _sitl_state->init(argc, argv);  // Parse --serial1=uart:/dev/...
+    scheduler->init();
+    serial(0)->begin(115200);       // ← TCP bind + accept() BLOQUANT ICI!
+    // ...
+    callbacks->setup();             // ← AP_Vehicle::setup() vient APRÈS!
+}
+```
+
+### Pourquoi l'Approche "HSM avant TCP dans setup()" Ne Fonctionne Pas
+
+```
+Séquence réelle:
+1. HAL_SITL::run() → serial(0)->begin() → TCP:5760 bind + accept()
+2. GCS se connecte (ou timeout)
+3. callbacks->setup() → AP_Vehicle::setup() → HSM init
+
+Modifier l'ordre dans setup() n'a AUCUN effet car TCP est déjà établi!
+```
+
+### Option Analysée: Modifier HAL_SITL_Class.cpp
+
+**Avantages:**
+- ✅ Permettrait Real HSM avant connexion TCP
+- ✅ GCS se connecterait à un système prêt
+
+**Inconvénients:**
+- ⚠️ Couplage architectural HAL → Application (mauvaise pratique)
+- ⚠️ HAL_SITL devrait inclure AP_HSM.h
+- ⚠️ Code spécifique SITL, pas portable vers Pixhawk
+
+### Décision: ABANDONNER
+
+L'architecture actuelle est acceptable:
+1. GCS se connecte via TCP
+2. HSM s'initialise (~25s pour Real HSM, instant pour Mock)
+3. Premier HEARTBEAT envoyé après HSM init
+4. Key exchange peut commencer
+
+**Le GCS doit simplement attendre ~30s avant de recevoir des données avec Real HSM.**
+
+### Architecture Actuelle (Conservée)
+
+```cpp
+// libraries/AP_Vehicle/AP_Vehicle.cpp
+void AP_Vehicle::setup() {
+    AP_Param::setup_sketch_defaults();
+    serial_manager.init_console();  // Note: TCP déjà établi par HAL!
+
+    // HSM init APRÈS TCP (GCS connecté mais attend HSM)
+    #if AP_HSM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    hsm.begin(hal.serial(1));
+    hsm.init_monolith();  // Mock=instant, Real=25s
+    // ... KeyOrchestrator, KEP, DDE ...
+    #endif
+}
+```
+
+### Commande pour Real HSM en SITL (fonctionne toujours)
+
+```bash
+# Le GCS doit attendre ~35s après connexion pour le premier HEARTBEAT
+./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200 &
+sleep 35  # Attendre HSM init
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 60
+```
 
 ---
 
@@ -244,7 +330,9 @@ Tools/hsm/
 ├── gcs_kep_client.py           # GCS client for key exchange
 ├── dual_dek_engine.py          # Feature 3: Python DualDekEngine
 ├── setup_mavlink.py            # MAVLink dialect generator
-└── mavlink_hsm.py              # Generated MAVLink dialect
+├── mavlink_hsm.py              # Generated MAVLink dialect
+├── test_kep_steps.py           # KEP test runner (27 tests)
+└── test_assertions.py          # Reusable test assertions
 ```
 
 ---
@@ -692,6 +780,112 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 
 ---
 
+## KEP Testing Framework - COMPLETE ✅
+
+### Overview
+
+Comprehensive test suite for validating Key Exchange Protocol (KEP) bidirectionally between SITL/Pixhawk (drone) and GCS.
+
+**27 tests** organized in **6 steps** covering the complete communication flow.
+
+### Test Files
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `Tools/hsm/test_kep_steps.py` | ~700 | Main test runner |
+| `Tools/hsm/test_assertions.py` | ~300 | Reusable assertions |
+
+### Test Coverage
+
+| Step | Name | Tests | Description |
+|------|------|-------|-------------|
+| 1 | HSM Init | 2 | Mock HSM (SITL) + Real HSM (GCS) |
+| 2 | HEARTBEAT | 4 | Bidirectional discovery |
+| 3 | WK Exchange | 6 | Wrapper Key exchange (msg 12000) |
+| 4 | DEK Exchange | 8 | Data Encryption Key via ECIES (msg 12001) |
+| 5 | KEY_ACK | 5 | Acknowledgments + error handling |
+| 6 | Encryption | 5 | ChaCha20 TX/RX validation |
+
+### Usage
+
+```bash
+# Run all 27 tests
+python3 Tools/hsm/test_kep_steps.py --all --no-hsm
+
+# Run specific step
+python3 Tools/hsm/test_kep_steps.py --step 3              # WK Exchange
+python3 Tools/hsm/test_kep_steps.py --step 4.6            # GCS ECIES decrypt
+
+# With real HSM
+python3 Tools/hsm/test_kep_steps.py --all --hsm /dev/ttyUSB0
+
+# Options
+python3 Tools/hsm/test_kep_steps.py --all --stop-on-fail  # Stop on first error
+python3 Tools/hsm/test_kep_steps.py --all --verbose       # Detailed logs
+```
+
+### Test Report Example
+
+```
+════════════════════════════════════════════════════════════════
+                    RAPPORT DE TEST KEP
+════════════════════════════════════════════════════════════════
+
+ÉTAPE 1: HSM INIT
+────────────────────────────────────────────────────────────────
+  ✓ 1.1 Mock HSM init (SITL)      PASS    [12ms]
+  ✓ 1.2 Real HSM init (GCS)       PASS    [24532ms]
+
+ÉTAPE 2: HEARTBEAT DISCOVERY
+  ✓ 2.1-2.4                       PASS
+
+ÉTAPE 3: WK EXCHANGE
+  ✓ 3.1-3.6                       PASS
+
+ÉTAPE 4: DEK EXCHANGE
+  ✓ 4.1-4.8                       PASS
+
+ÉTAPE 5: KEY_ACK
+  ✓ 5.1-5.5                       PASS
+
+ÉTAPE 6: ENCRYPTION
+  ✓ 6.1-6.5                       PASS
+
+════════════════════════════════════════════════════════════════
+RÉSULTAT: 27/27 TESTS PASSED
+════════════════════════════════════════════════════════════════
+```
+
+### Key Assertions (test_assertions.py)
+
+```python
+class TestAssertions:
+    # HSM Init
+    def assert_hsm_init_time(self, init_time_ms, max_ms, is_mock=True)
+    def assert_mk_present(self, mk_bytes)
+
+    # HEARTBEAT
+    def assert_heartbeat_received(self, msg, timeout_s, expected_sysid=None)
+    def assert_peer_created(self, peers, sysid)
+
+    # WK Exchange
+    def assert_wk_public_size(self, wk_public)
+    def assert_wk_stored(self, peer, wk_public)
+
+    # DEK Exchange
+    def assert_ecies_decrypt_success(self, success)
+    def assert_dek_stored(self, peer, dek)
+
+    # State
+    def assert_state_complete(self, state, sysid)
+
+    # Encryption
+    def assert_message_encrypted(self, is_bad_crc, msgid)
+    def assert_decrypt_success(self, plaintext, expected_msgid)
+```
+
+---
+
 ## Known Issues & Limitations
 
 | Issue | Description | Workaround |
@@ -699,7 +893,8 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 | SITL blocking | HSM init bloque TCP pendant ~25s | GCS client attend 60s pour heartbeat |
 | No MAC on payload | ChaCha20 stream cipher sans authentification | CRC MAVLink sert de checksum (pas crypto) |
 | Single connection SITL | SITL s'arrête si connexion TCP fermée | Garder connexion ouverte ou reconnecter |
-| BAD_DATA spam | Messages chiffrés = BAD_CRC côté GCS Python | Filtrer avec `grep -v BAD_DATA` |
+| **CRC mismatch** | CRC calculé sur plaintext mais payload chiffré | **Session 21** - Recalculer CRC sur ciphertext |
+| ~~BAD_DATA spam~~ | ~~Messages chiffrés = BAD_CRC côté GCS Python~~ | **EN COURS** Session 21 - CRC Fix |
 | ~~uECC crash ARM~~ | ~~Toutes les fonctions uECC crashent sur Pixhawk5X~~ | **RÉSOLU** Session 5 - Fix config platform |
 | ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 5 |
 | ~~DEK not sent~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | **RÉSOLU** Session 6 |
@@ -710,565 +905,152 @@ python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 120
 
 | Priority | Task | Description | Status |
 |----------|------|-------------|--------|
-| 1 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
-| 2 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
-| 3 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
-| 4 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
-| 5 | **Pi Zero Bridge** | Configurer Pi Zero comme pont Pixhawk↔HSM | ⏳ En attente matériel |
-| 6 | Multi-drone | Tester avec 2+ drones mesh | |
-| 7 | DEK rotation | Rotation de clés en vol | |
+| **1** | **CRC Fix (Session 21)** | **Recalculer CRC sur ciphertext dans buffer[2]** | ⏳ **À FAIRE** |
+| 2 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
+| 3 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
+| 4 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
+| 5 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
+| 6 | **Pi Zero Bridge** | Configurer Pi Zero comme pont Pixhawk↔HSM | ⏳ En attente matériel |
+| 7 | Multi-drone | Tester avec 2+ drones mesh | |
+| 8 | DEK rotation | Rotation de clés en vol | |
 
 ---
 
-## Test Pixhawk Mock HSM (2026-01-25)
+## Session History
 
-### Session 1: Découverte du problème WK
+> **Détails complets:** Voir `CLAUDE_HISTORY.md` pour l'historique détaillé des sessions 1-22.
 
-```
-✅ Firmware flashé sur Pixhawk5X avec Mock HSM
-✅ GCS connecté avec Real HSM (/dev/ttyUSB0)
-✅ MAVLink connecté au Pixhawk (/dev/ttyACM0)
-✅ HEARTBEAT reçu du Pixhawk (sysid=1)
-✅ WK_EXCHANGE envoyé par GCS → Pixhawk
-✅ KEY_ACK reçu du Pixhawk (status=SUCCESS, phase=WK_RECEIVED)
-❌ Pixhawk ne renvoie PAS son WK_EXCHANGE au GCS
-```
+### Résumé des sessions clés
 
-### Session 2: Crash uECC découvert et contourné
+| Session | Date | Résultat |
+|---------|------|----------|
+| 5 | 2026-01-26 | Fix uECC ARM (config forçait x86_64) |
+| 6 | 2026-01-26 | Full KEP working (RNG + peer reset) |
+| 9 | 2026-01-27 | Pixhawk Mock HSM SUCCESS (42 msg déchiffrés) |
+| 10 | 2026-02-03 | Analyse HSM vs TCP - ABANDONNÉ (TCP bind dans HAL) |
+| 11 | 2026-02-03 | KEP Test Framework - 27 tests bidirectionnels |
+| 21 | 2026-02-04 | Analyse CRC vs Encryption - Solution B retenue |
+| **22** | **2026-02-04** | **CRC Fix implémenté - Key Exchange COMPLETE** |
 
-**Problème critique découvert:** `uECC_compute_public_key()` crash sur ARM (Pixhawk5X)
+### Session 10 - Analyse TCP vs HSM Init
 
-**Diagnostic étape par étape:**
-```
-1. HSM disabled:              ✅ Pixhawk stable (heartbeat OK)
-2. HSM + Mock init only:      ✅ Stable
-3. + KeyOrchestrator:         ❌ CRASH (printf → hal.console->printf)
-4. + printf fix:              ❌ CRASH (toujours)
-5. + RNG only:                ✅ Stable
-6. + RNG + HKDF:              ✅ Stable
-7. + RNG + HKDF + uECC:       ❌ CRASH
-```
+**Objectif initial:** Déplacer HSM init AVANT TCP pour Real HSM en SITL
 
-**Cause:** `uECC_compute_public_key()` de micro-ecc crash sur ARM Cortex-M7.
-Possible stack overflow ou incompatibilité P-256 sur cette plateforme.
+**Découverte clé:**
+- Le TCP bind/accept se fait dans `HAL_SITL_Class.cpp:run()` AVANT `setup()`
+- Modifier l'ordre dans `AP_Vehicle::setup()` n'a AUCUN effet
+- Pour vraiment mettre HSM avant TCP, il faudrait modifier la HAL (couplage indésirable)
 
-**Workaround appliqué:** WK_public calculé par pseudo-PRNG au lieu de uECC:
-```cpp
-// KeyOrchestrator.cpp - init_mission_keys()
-// SKIP uECC on Pixhawk (causes crash)
-for (int i = 0; i < WK_PUBLIC_SIZE; i++) {
-    _wk_public[i] = _wk_private[i % KEY_SIZE] ^ (uint8_t)(i * 17 + 0x5A);
-}
-```
-**Note:** Ce n'est PAS cryptographiquement sûr, mais permet de tester le protocole.
+**Décision:** ABANDONNER cette approche
+- L'architecture actuelle fonctionne
+- GCS attend ~30s avec Real HSM, c'est acceptable
+- Pas de couplage HAL → Application
 
-### Résultat avec workaround
+**Code revenu à l'état original:**
+- HSM init APRÈS `serial_manager.init_console()` dans `AP_Vehicle.cpp`
 
-```
-✅ Pixhawk stable (pas de crash)
-✅ KeyOrchestrator: RNG + HKDF fonctionnent
-✅ WK_public généré (pseudo-random, non-ECC)
-✅ KEP initialisé
-✅ KEY_ACK reçu du Pixhawk (SUCCESS, WK_RECEIVED)
-❌ Pixhawk ne renvoie toujours pas son WK_EXCHANGE
-```
-
-### Prochain problème à résoudre
-
-Le `handle_wk_exchange()` appelle `send_wk_exchange()` mais le message n'arrive pas au GCS.
-Possibilités:
-1. Message envoyé mais payload_len incorrect
-2. GCS ne parse pas correctement (UNKNOWN_12000 avec mauvais format)
-3. Canal MAVLink incorrect
-
-**Fichiers à investiguer:**
-- `libraries/AP_HSM/KeyExchangeProtocol.cpp`: `send_wk_exchange()`
-- `Tools/hsm/gcs_kep_client.py`: parsing de UNKNOWN_12000
-
-### Session 3: Key Exchange SITL - COMPLET ✅
-
-**Date:** 2026-01-25
-
-**Problèmes résolus:**
-
-1. **WK_EXCHANGE non parsé par GCS**
-   - Cause: `mavutil.mavlink` n'était pas remplacé par notre dialect HSM
-   - Solution: Ajout `mavutil.mavlink = mavlink_hsm` dans gcs_kep_client.py
-
-2. **Attribut incorrect dans DEK_EXCHANGE**
-   - Cause: `msg.ephemeral_pub` au lieu de `msg.ephemeral_pubkey`
-   - Solution: Correction dans gcs_kep_client.py ligne 496
-
-3. **GCS ne détecté pas par le drone**
-   - Cause: Le GCS n'envoyait pas de HEARTBEAT
-   - Solution: Le client envoie maintenant des HEARTBEAT pour être détecté par KEP
-
-**Résultat final - SITL avec Real HSM:**
-```
-✅ HSM init (Feature 1): ~25s bloquant
-✅ KeyOrchestrator (Feature 2.1): MK+WK+DEK générés
-✅ KeyExchangeProtocol (Feature 2.2): WK bidirectionnel
-✅ DEK exchange: ECIES XChaCha20-Poly1305
-✅ DualDekEngine (Feature 3): Messages déchiffrés
-
-Test final:
-- GCS → Drone: HSM_WK_EXCHANGE (wk=0446acf6...)  ✅
-- Drone → GCS: HSM_WK_EXCHANGE                   ✅
-- GCS → Drone: HSM_KEY_ACK (WK_RECEIVED)         ✅
-- Drone → GCS: HSM_DEK_EXCHANGE                  ✅
-- GCS → Drone: HSM_KEY_ACK (DEK_RECEIVED)        ✅
-- Drone → GCS: HSM_KEY_ACK                       ✅
-- 45 messages decrypted OK                       ✅
-```
-
-**Fichiers modifiés cette session:**
-- `Tools/hsm/gcs_kep_client.py` - Fix attribute names (ephemeral_pubkey, auth_tag)
-
-### Session 4: Pixhawk KEP - COMPLET ✅
-
-**Date:** 2026-01-26
-
-**Problème initial:** Pixhawk ne renvoyait pas son WK_EXCHANGE malgré KEY_ACK envoyé.
-
-**Diagnostic approfondi:**
-```
-1. WK_EXCHANGE envoyé mais clé invalide → ECIES rejette "Invalid EC key"
-2. Cause: Pseudo-PRNG générait des bytes arbitraires, pas un point P-256 valide
-3. Solution: Hardcoded valid P-256 test keypair
-4. Nouveau problème: DEK_EXCHANGE pas envoyé
-5. Cause: uECC_make_key() et uECC_shared_secret() crashent aussi sur ARM
-6. Solution: ECIES bypass complet avec clés de test
-```
-
-**Fonctions uECC qui crashent sur ARM Cortex-M7:**
-- `uECC_compute_public_key()` - calcul clé publique
-- `uECC_make_key()` - génération keypair éphémère
-- `uECC_shared_secret()` - calcul secret partagé ECDH
-
-**Solution implémentée - Clés de test hardcodées:**
-
-**KeyOrchestrator.cpp** - Valid P-256 test keypair:
-```cpp
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
-static const uint8_t TEST_WK_PRIVATE[32] = {
-    0x62, 0x7C, 0x7F, 0xA1, 0x06, 0x6C, 0xB7, 0xAE,
-    0xFF, 0x04, 0xA0, 0x92, 0x75, 0x10, 0x24, 0x6A,
-    0xEF, 0x6D, 0xB8, 0xA6, 0x3B, 0xF3, 0x88, 0x92,
-    0x17, 0xFC, 0x2E, 0x86, 0xE8, 0x0F, 0x1A, 0xE9
-};
-static const uint8_t TEST_WK_PUBLIC[64] = {
-    0xDD, 0x08, 0x68, 0x0F, 0xC5, 0x06, 0x87, 0xFA,
-    0x70, 0xA6, 0x1B, 0x29, 0xDE, 0x9E, 0x24, 0xC8,
-    0xBA, 0x0C, 0x8B, 0x19, 0x9E, 0x8C, 0x39, 0x7A,
-    0xD3, 0xF0, 0xB9, 0x23, 0x28, 0x2A, 0xD5, 0xEB,
-    0x6F, 0x4A, 0x7E, 0x01, 0xE2, 0x86, 0xBE, 0xC3,
-    0x85, 0x0F, 0x77, 0xAC, 0x6B, 0x0F, 0xE7, 0x47,
-    0xB8, 0x91, 0xD9, 0xE9, 0x62, 0x78, 0x3D, 0x7A,
-    0x34, 0xB4, 0xCE, 0x44, 0x94, 0xB8, 0x29, 0x6E
-};
-#endif
-```
-
-**KeyExchangeProtocol.cpp** - ECIES bypass:
-```cpp
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL
-static const uint8_t TEST_EPHEMERAL_PUBLIC[64] = { /* ... */ };
-static const uint8_t TEST_SHARED_SECRET[32] = {
-    0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA,
-    0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00
-};
-#endif
-
-// In ecies_encrypt_dek():
-#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // Use real uECC
-    uECC_make_key(ephemeral_pub_out, ephemeral_priv, curve);
-    ecdh_compute_shared(ephemeral_priv, peer_wk_pub, shared_secret);
-#else
-    // Pixhawk: bypass with test keys
-    memcpy(ephemeral_pub_out, TEST_EPHEMERAL_PUBLIC, 64);
-    memcpy(shared_secret, TEST_SHARED_SECRET, 32);
-#endif
-```
-
-**Résultat final - Pixhawk5X avec Mock HSM:**
-```
-✅ Mock HSM init instantané
-✅ KeyOrchestrator: MK+WK+DEK avec clés de test
-✅ HSM_WK_EXCHANGE bidirectionnel
-✅ HSM_DEK_EXCHANGE bidirectionnel
-✅ HSM_KEY_ACK bidirectionnel
-✅ Protocole KEP complet fonctionnel!
-
-Flux observé:
-- GCS → Pixhawk: HSM_WK_EXCHANGE (wk=cdb05936...)
-- Pixhawk → GCS: HSM_WK_EXCHANGE (wk=dd08680f...)  ← FONCTIONNE!
-- GCS → Pixhawk: HSM_KEY_ACK (WK_RECEIVED)
-- Pixhawk → GCS: HSM_DEK_EXCHANGE                  ← FONCTIONNE!
-- GCS → Pixhawk: HSM_KEY_ACK (DEK_RECEIVED)
-- Pixhawk → GCS: HSM_KEY_ACK (DEK_RECEIVED)
-```
-
-**Limitation connue:**
-- ECIES decrypt échoue côté GCS (clés de test ne matchent pas vraie crypto)
-- Normal car Pixhawk utilise TEST_SHARED_SECRET, GCS calcule vrai ECDH
-- Solution future: remplacer micro-ecc par mbedtls ou autre lib ECC ARM-compatible
-
-**Fichiers modifiés Session 4:**
-- `libraries/AP_HSM/KeyOrchestrator.cpp` - TEST_WK_PRIVATE/PUBLIC hardcodées
-- `libraries/AP_HSM/KeyExchangeProtocol.cpp` - ECIES bypass avec clés de test
-
-### Session 5: Fix uECC - REAL CRYPTO WORKS! ✅
-
-**Date:** 2026-01-26
-
-**Problème découvert:** uECC_config.h forçait la plateforme x86_64 même sur ARM:
-```cpp
-// AVANT (FAUX):
-#define uECC_PLATFORM 2  /* uECC_x86_64 */
-#define uECC_WORD_SIZE 8
-```
-
-Ceci compilait du code 64-bit sur processeur 32-bit → crash!
-
-**Solution:** Auto-détection de plateforme via macros compilateur:
-```cpp
-// APRÈS (CORRECT):
-#if defined(__x86_64__)
-    #define uECC_PLATFORM uECC_x86_64
-    #define uECC_WORD_SIZE 8
-#elif defined(__arm__)
-    #define uECC_PLATFORM uECC_arm_thumb2
-    #define uECC_WORD_SIZE 4
-    #define uECC_ARM_USE_UMAAL 0
-#endif
-```
-
-**Changements:**
-- `libraries/micro-ecc/uECC_config.h` - Auto-detect platform
-- `libraries/AP_HSM/KeyOrchestrator.cpp` - Supprimé bypass test keys
-- `libraries/AP_HSM/KeyExchangeProtocol.cpp` - Supprimé ECIES bypass
-
-**Résultat - Vraie crypto P-256 sur Pixhawk5X:**
-```
-✅ uECC_compute_public_key() fonctionne!
-✅ uECC_make_key() fonctionne!
-✅ uECC_shared_secret() fonctionne!
-✅ WK_EXCHANGE bidirectionnel avec vraie clé (85886055...)
-✅ KEY_ACK (WK_RECEIVED + DEK_RECEIVED) reçus
-```
-
-**Commit:** `75656daedf` - Fix uECC crash on ARM Cortex-M7
-
-### Session 6: Full Key Exchange Working! ✅
-
-**Date:** 2026-01-26
-
-**Problème découvert:** ECIES encryption échouait - `uECC_make_key()` retournait 0.
-
-**Cause:** Le RNG n'était pas configuré pour uECC dans `KeyExchangeProtocol::ecies_encrypt_dek()`.
-`uECC_set_rng()` était appelé dans `KeyOrchestrator` mais pas dans `KeyExchangeProtocol`.
-
-**Solution 1 - Fix RNG (KeyExchangeProtocol.cpp):**
-```cpp
-// RNG callback for uECC
-static int kep_rng_callback(uint8_t* dest, unsigned int size) {
-    if (hal.util->get_random_vals(dest, size)) return 1;
-    return 0;
-}
-
-bool KeyExchangeProtocol::ecies_encrypt_dek(...) {
-    uECC_set_rng(&kep_rng_callback);  // MUST call before uECC_make_key
-    // ...
-}
-```
-
-**Solution 2 - Peer Reset (KeyExchangeProtocol.cpp):**
-```cpp
-#define KEP_PEER_RESET_TIMEOUT_MS  30000  // 30 seconds
-
-// In on_heartbeat_received():
-if (inactive_time > KEP_PEER_RESET_TIMEOUT_MS &&
-    (peer->state == COMPLETE || peer->state == ERROR)) {
-    peer->state = State::IDLE;  // Reset for re-exchange
-}
-```
-
-**Solution 3 - GCS Heartbeats (gcs_kep_client.py):**
-```python
-def _send_heartbeat(self):
-    self.mav.mav.heartbeat_send(6, 8, 0, 0, 4)  # MAV_TYPE_GCS
-
-# Send periodic heartbeats so Pixhawk detects GCS peer
-```
-
-**Changements:**
-- `libraries/AP_HSM/KeyExchangeProtocol.cpp` - RNG fix + peer reset + debug logs
-- `Tools/hsm/gcs_kep_client.py` - GCS heartbeats + STATUSTEXT display
-- `libraries/GCS_MAVLink/GCS_MAVLink.cpp` - STATUSTEXT plaintext for debug
-
-**Résultat - Échange bidirectionnel complet:**
-```
-✅ uECC_make_key() fonctionne (RNG configuré)
-✅ uECC_shared_secret() fonctionne
-✅ ECIES encryption/decryption OK
-✅ WK_EXCHANGE bidirectionnel
-✅ DEK_EXCHANGE bidirectionnel (enfin!)
-✅ Peer reset après 30s (re-exchange sans reboot)
-✅ GCS heartbeats détectés par Pixhawk
-✅ state=COMPLETE wk_recv=True dek_recv=True
-✅ Peer DEKs stored: 1
-```
-
-**Commit:** `2c13981c60` - Fix key exchange: RNG + peer reset + GCS heartbeats
-
-### Session 7: Pi Zero Bridge Architecture (2026-01-27)
-
-**Problème découvert:** Impossible de connecter directement le HSM au Pixhawk.
-
-**Configuration testée (ÉCHEC):**
-```
-Pixhawk TELEM1 (TTL) ←→ CH340G (TTL→USB) ←→ HSM ESP32 (USB-C)
-                              ↑
-                      PROBLÈME ICI!
-```
-
-**Cause:** Le convertisseur USB-TTL CH340G (xiwai) et le HSM ESP32 sont tous deux des **USB devices (esclaves)**. Deux USB devices ne peuvent pas communiquer directement - il faut un USB host.
-
-**Ports du Pixhawk5X analysés:**
-| Port | Type | Compatible USB Host? |
-|------|------|---------------------|
-| USB-C | USB Device | ❌ Non (esclave) |
-| TELEM1 | TTL Série (JST-GH 6pin) | ❌ Non |
-| TELEM2 | TTL Série (JST-GH 6pin) | ❌ Non |
-| TELEM3 | TTL Série (JST-GH 6pin) | ❌ Non |
-| GPS1/2 | TTL Série (JST-GH) | ❌ Non |
-| DEBUG | TTL Série (JST-SH) | ❌ Non |
-
-**Conclusion:** Le Pixhawk5X n'a **aucun port USB Host**. Impossible de connecter le HSM directement.
-
----
-
-**Solution retenue: Raspberry Pi Zero comme pont**
-
-```
-┌─────────────┐         ┌─────────────────┐         ┌─────────────┐
-│  Pixhawk5X  │  TTL    │  Raspberry Pi   │   USB   │  HSM ESP32  │
-│             │ ───────►│     Zero        │────────►│             │
-│   TELEM1    │ ◄───────│  (pont série)   │◄────────│   USB-C     │
-└─────────────┘         └─────────────────┘         └─────────────┘
-     JST-GH              GPIO + USB OTG              USB-C
-```
-
-**Avantages du Pi Zero:**
-- Port USB OTG = **USB Host** capable de communiquer avec le HSM
-- GPIO UART = Communication TTL avec Pixhawk
-- Petit, léger (~9g), peu cher (~15€)
-- Peut aussi servir de companion computer
-
----
-
-**Câblage Pixhawk TELEM1 → Pi Zero GPIO:**
-```
-Pixhawk TELEM1 (JST-GH 6pin)     Raspberry Pi Zero
-────────────────────────────     ─────────────────
-Pin 1 : +5V          ───►        Pin 2/4 : 5V (ou alim séparée)
-Pin 2 : TX           ───►        Pin 10 : GPIO15 (RX)
-Pin 3 : RX           ◄───        Pin 8  : GPIO14 (TX)
-Pin 4 : CTS          (non utilisé)
-Pin 5 : RTS          (non utilisé)
-Pin 6 : GND          ───►        Pin 6  : GND
-```
-
-**Câblage HSM → Pi Zero USB:**
-```
-HSM (USB-C) ──► Câble USB-C vers USB-A ──► Adaptateur OTG ──► Pi Zero (micro-USB)
-```
-
----
-
-**Script pont créé:** `Tools/hsm/pi_zero_bridge.py`
-
-Fonctionnalités:
-- Détection automatique du port HSM (/dev/ttyUSB0, ttyACM0, etc.)
-- Pont bidirectionnel transparent Pixhawk ↔ HSM
-- Logs de debug avec timestamp
-- Gestion d'erreurs et reconnexion
-
----
-
-**Checklist matériel pour Pi Zero Bridge:**
-| Item | Status |
-|------|--------|
-| Raspberry Pi Zero (W ou WH) | ⬜ |
-| Carte microSD (8GB+) | ⬜ |
-| Adaptateur micro-USB OTG (mâle→USB-A femelle) | ⬜ |
-| Câble USB-A vers USB-C (pour HSM) | ⬜ |
-| Fils Dupont femelle-femelle (3x minimum) | ⬜ |
-| Câble/adaptateur JST-GH 6pin TELEM1 vers fils | ⬜ |
-| Alimentation Pi Zero (5V micro-USB ou via Pixhawk) | ⬜ |
-
----
-
-**Configuration Pi Zero:**
+### Commande de test validée
 
 ```bash
-# 1. Flasher Raspberry Pi OS Lite sur microSD
-# 2. Activer SSH et WiFi dans Raspberry Pi Imager
+# Pixhawk avec Mock HSM + GCS avec Real HSM
+python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120
 
-# 3. Sur le Pi Zero via SSH:
-sudo raspi-config
-# -> Interface Options -> Serial Port
-#    - Login shell over serial: NO
-#    - Serial port hardware: YES
-# -> Finish -> Reboot
-
-# 4. Installer dépendances:
-sudo apt update && sudo apt install -y python3-serial
-
-# 5. Copier le script:
-scp Tools/hsm/pi_zero_bridge.py pi@<IP_PI>:/home/pi/
-
-# 6. Lancer le pont:
-sudo python3 /home/pi/pi_zero_bridge.py
+# SITL avec Real HSM (NOUVEAU - à tester)
+./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200
 ```
 
----
+### Session 11 - KEP Test Framework (2026-02-03)
 
-**Service systemd (optionnel):**
+**Objectif:** Créer un framework de test complet pour valider le Key Exchange Protocol
 
+**Fichiers créés:**
+
+| Fichier | Lignes | Description |
+|---------|--------|-------------|
+| `Tools/hsm/test_kep_steps.py` | ~700 | Test runner principal avec 27 tests |
+| `Tools/hsm/test_assertions.py` | ~300 | Assertions réutilisables |
+
+**Tests implémentés (27 total):**
+
+| Étape | Tests | Description |
+|-------|-------|-------------|
+| 1 | 1.1, 1.2 | HSM Init (Mock + Real) |
+| 2 | 2.1-2.4 | HEARTBEAT discovery bidirectionnel |
+| 3 | 3.1-3.6 | WK Exchange (envoie/reçoit/state) |
+| 4 | 4.1-4.8 | DEK Exchange + ECIES decrypt |
+| 5 | 5.1-5.5 | KEY_ACK + gestion erreurs |
+| 6 | 6.1-6.5 | Encryption TX/RX + plaintext |
+
+**Usage:**
 ```bash
-# /etc/systemd/system/hsm-bridge.service
-[Unit]
-Description=HSM Bridge Pixhawk
-After=network.target
+# Tous les tests
+python3 Tools/hsm/test_kep_steps.py --all --no-hsm
 
-[Service]
-ExecStart=/usr/bin/python3 /home/pi/pi_zero_bridge.py
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-
-# Activer:
-sudo systemctl enable hsm-bridge
-sudo systemctl start hsm-bridge
+# Test spécifique
+python3 Tools/hsm/test_kep_steps.py --step 4.6  # GCS ECIES decrypt
 ```
 
----
+**Couverture identifiée mais non implémentée:**
+- Peer Reset 30s timeout
+- Race conditions (initiation simultanée)
+- WK retry sur perte
+- Multi-peer (>2 drones)
+- Nonce rollover (seq 255→0)
 
-**Prochaine étape:** Continuer tests multi-drone ou attendre Pi Zero pour connexion directe.
+### Session 21 - CRC Fix: Recalculer CRC sur Ciphertext (2026-02-04)
 
----
+**Problème analysé:** Le CRC MAVLink est calculé sur le payload PLAINTEXT, mais le payload est chiffré APRÈS. Le RX calcule le CRC sur le CIPHERTEXT → mismatch → BAD_CRC.
 
-## Session 9: Test Pixhawk Mock HSM - SUCCÈS! ✅ (2026-01-27)
-
-### Architecture testée
-
+**Séquence actuelle (problématique):**
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│   PIXHAWK 5X                           PC (GCS)                         │
-│   ┌─────────────────┐                  ┌─────────────────┐             │
-│   │  ArduCopter     │    USB/Radio     │  gcs_kep_client │             │
-│   │  + KEP + DDE    │◄────────────────►│                 │             │
-│   └────────┬────────┘   /dev/ttyACM0   └────────┬────────┘             │
-│            │                                     │                      │
-│   ┌────────▼────────┐                  ┌────────▼────────┐             │
-│   │   MOCK HSM      │                  │   REAL HSM      │             │
-│   │   (RAM)         │                  │  /dev/ttyUSB0   │             │
-│   │   Instantané    │                  │  LeMonolith     │             │
-│   └─────────────────┘                  └─────────────────┘             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+mavlink_helpers.h:365-369  →  CRC = crc(PLAINTEXT)
+GCS_MAVLink.cpp:237        →  Encrypt(payload)
+→ RX: CRC(ciphertext) ≠ CRC_reçu → BAD_CRC
 ```
 
-### Commandes de test
+**Solution retenue (Option B):** Recalculer le CRC sur le ciphertext dans `comm_send_buffer()` buffer[2]
 
-```bash
-# 1. Vérifier Mock HSM activé
-grep "AP_HSM_MOCK_ENABLED" libraries/AP_HSM/AP_HSM.h
-# → #define AP_HSM_MOCK_ENABLED 1
+```cpp
+// Variables statiques par channel
+static uint8_t stored_header[MAVLINK_COMM_NUM_BUFFERS][10];
+static uint8_t stored_ciphertext[MAVLINK_COMM_NUM_BUFFERS][256];
+static uint8_t stored_ciphertext_len[MAVLINK_COMM_NUM_BUFFERS];
+static bool was_encrypted[MAVLINK_COMM_NUM_BUFFERS];
 
-# 2. Compiler et flasher
-./waf configure --board Pixhawk5X
-./waf copter
-./waf --upload copter
+// buffer[2]: Recalculer CRC
+if (current_buffer == 2 && was_encrypted[chan]) {
+    uint16_t crc;
+    crc_init(&crc);
+    // Header (bytes 1-9, sans STX)
+    for (int i = 1; i < 10; i++) {
+        crc_accumulate(stored_header[chan][i], &crc);
+    }
+    // Ciphertext
+    crc_accumulate_buffer(&crc, (char*)stored_ciphertext[chan], stored_ciphertext_len[chan]);
+    // CRC extra
+    const mavlink_msg_entry_t* entry = mavlink_get_msg_entry(msgid);
+    if (entry) crc_accumulate(entry->crc_extra, &crc);
 
-# 3. Vérifier ports
-ls -la /dev/ttyACM0  # Pixhawk
-ls -la /dev/ttyUSB0  # HSM
-
-# 4. Lancer test (PARAMÈTRES IMPORTANTS!)
-python3 Tools/hsm/gcs_kep_client.py \
-    --mavlink /dev/ttyACM0 \
-    --hsm /dev/ttyUSB0 \
-    --timeout 120
+    uint8_t ck[2] = {(uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+    write(ck, 2);
+    return;
+}
 ```
 
-### Résultats du test
+**Fichiers à modifier:**
 
-```
-============================================================
-  GCS Key Exchange Protocol Client
-============================================================
-  MAVLink: /dev/ttyACM0
-  HSM Port: /dev/ttyUSB0
-  GCS ID: sysid=255 compid=190
-============================================================
+| Fichier | Modification |
+|---------|--------------|
+| `GCS_MAVLink.cpp` | Stocker header/ciphertext + recalculer CRC buffer[2] |
+| `GCS_Common.cpp` | Simplifier RX: décrypter après CRC OK |
 
-[04:53:24] [INFO] Starting GCS KEP Client...
-[04:53:24] [INFO] Initializing HSM...
-[GCS_HSM] HSM initialise avec succes
-[GCS_HSM] === Mission Keys OK ===
-[GCS_HSM]   Temps: 10962 ms
-[04:53:35] [INFO] Connected to system 1 component 0
-[KEP] WK public initialized: f983da53077886bb...
+**Avantages:**
+- ✅ CRC valide côté RX (plus de BAD_CRC)
+- ✅ Intégrité vérifiable
+- ✅ Modification localisée (1 fichier principal)
+- ✅ RAM: ~266 bytes/channel
 
-==================================================
-FINAL STATUS
-==================================================
-GCS sysid: 255
-WK public ready: True
-Peers: 1
-  Peer 1: state=COMPLETE wk_recv=True dek_recv=True  ✅
-Peer DEKs stored: 1
-  sysid=1: 6c41431d...
-
-DualDekEngine Status:
-  Ready: YES  ✅
-  Peers with DEK: [1]
-  TX encrypted: 0
-  RX decrypted: 0
-  RX failed: 0
-
-Crypto Statistics:
-  Encrypted received: 42
-  Decrypted OK: 42  ✅
-  Decrypted FAIL: 0
-==================================================
-```
-
-### Paramètres clés
-
-| Paramètre | Valeur | Description |
-|-----------|--------|-------------|
-| `--mavlink` | `/dev/ttyACM0` | Port USB Pixhawk |
-| `--hsm` | `/dev/ttyUSB0` | Port USB HSM LeMonolith |
-| `--timeout` | `120` | Timeout en secondes |
-| `--no-hsm` | (flag) | Mode sans HSM (pour SITL) |
-| `--verbose` | (flag) | Logs détaillés |
-
-### Problèmes résolus cette session
-
-| Problème | Solution |
-|----------|----------|
-| HSM envoie garbage | Débrancher/rebrancher USB physiquement |
-| "Connection refused" | Utiliser `--mavlink /dev/ttyACM0` (pas TCP) |
-| Mock HSM désactivé | Restaurer `AP_HSM_MOCK_ENABLED 1` |
+**Status:** ⏳ À implémenter dans Session 22
 
 ---
 
@@ -1284,4 +1066,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-01-27 (Session 9) - TEST PIXHAWK RÉUSSI! Architecture Pixhawk (Mock HSM) + GCS (Real HSM) fonctionne. Key Exchange complet, 42 messages déchiffrés OK. Commande: `python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --timeout 120`
+**Last update:** 2026-02-04 - Session 22: CRC Fix implémenté. Recalcul CRC sur ciphertext dans buffer[2]. Key exchange COMPLETE testé avec succès.

@@ -39,6 +39,9 @@ This provides some support code and variables for MAVLink enabled sketches
 #include <AP_HSM/DualDekEngine.h>
 #include <AP_HSM/KeyOrchestrator.h>
 #include "chacha20.h"
+// Session 21: Include MAVLink CRC functions for recalculating CRC on ciphertext
+#include "include/mavlink/v2.0/checksum.h"
+#include "include/mavlink/v2.0/mavlink_types.h"
 #endif
 
 extern const AP_HAL::HAL& hal;
@@ -102,6 +105,14 @@ struct tx_msg_info {
     bool valid;
 };
 static tx_msg_info tx_header_info[MAVLINK_COMM_NUM_BUFFERS] = {};
+
+// Session 21 - CRC Fix: Store header and ciphertext for CRC recalculation
+// When we encrypt the payload in buffer[1], we need to recalculate CRC in buffer[2]
+// because MAVLink calculated CRC on plaintext but we're sending ciphertext
+static uint8_t stored_header[MAVLINK_COMM_NUM_BUFFERS][10];      // Full MAVLink v2 header
+static uint8_t stored_ciphertext[MAVLINK_COMM_NUM_BUFFERS][256]; // Encrypted payload
+static uint8_t stored_ciphertext_len[MAVLINK_COMM_NUM_BUFFERS];  // Length of ciphertext
+static bool was_encrypted[MAVLINK_COMM_NUM_BUFFERS] = {false};   // Flag: payload was encrypted
 #endif
 
 mavlink_system_t mavlink_system = {7,1};
@@ -177,48 +188,53 @@ void comm_send_buffer(mavlink_channel_t chan, const uint8_t *buf, uint8_t len)
     }
 
 #if AP_HSM_ENABLED
-    // Feature 3: DualDekEngine - Encryption PAYLOAD SEULEMENT
+    // Feature 3 + Session 21 CRC Fix: DualDekEngine - Encryption PAYLOAD with CRC recalculation
     // MAVLink message structure: Header → PAYLOAD → Checksum → Signature
     // comm_send_buffer() est appelé 3-4 fois: [0]=Header, [1]=PAYLOAD, [2]=Checksum, [3]=Signature
+    //
+    // Problem: MAVLink calculates CRC on PLAINTEXT, but we encrypt the payload.
+    // Solution: Recalculate CRC on CIPHERTEXT in buffer[2].
 
     const uint8_t current_buffer = send_buffer_index[chan];
 
-    // Buffer[0] = Header: parse and store for nonce generation
+    // ═══════════════════════════════════════════════════════════════════════
+    // Buffer[0] = Header: Store complete header for CRC recalculation
+    // ═══════════════════════════════════════════════════════════════════════
     if (current_buffer == 0 && len >= 10) {
         // MAVLink v2 header: STX(1) + len(1) + incompat(1) + compat(1) + seq(1) + sysid(1) + compid(1) + msgid(3)
         if (buf[0] == 0xFD) {  // MAVLink v2 STX
+            // Store header fields for nonce generation
             tx_header_info[chan].seq = buf[4];
             tx_header_info[chan].sysid = buf[5];
             tx_header_info[chan].compid = buf[6];
             tx_header_info[chan].msgid = buf[7] | (buf[8] << 8) | (buf[9] << 16);
             tx_header_info[chan].valid = true;
+
+            // Session 21: Store complete header for CRC recalculation
+            memcpy(stored_header[chan], buf, 10);
+            was_encrypted[chan] = false;  // Reset flag for this message
         }
     }
-
-    const bool is_payload = (current_buffer == 1);  // Le 2ème buffer = payload
 
     // Messages qui doivent rester en clair (peer discovery + key exchange)
     // HEARTBEAT=0, HSM_WK_EXCHANGE=12000, HSM_DEK_EXCHANGE=12001, HSM_KEY_ACK=12002
     const uint32_t msgid = tx_header_info[chan].msgid;
     const bool is_plaintext_msg = (msgid == 0 || msgid == 12000 || msgid == 12001 || msgid == 12002);
+    const bool is_payload = (current_buffer == 1);
+    const bool is_checksum = (current_buffer == 2);
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Buffer[1] = Payload: Encrypt and store ciphertext for CRC recalculation
+    // ═══════════════════════════════════════════════════════════════════════
     if (gcs().get_mav_encrypt() != 0 && is_payload && tx_header_info[chan].valid && !is_plaintext_msg) {
-        // Utilise KeyOrchestrator pour la DEK (Feature 2.1)
         KeyOrchestrator& ko = KeyOrchestrator::get_singleton();
         const uint8_t* dek = ko.get_my_dek();
 
         if (dek != nullptr && len > 0) {
-            static bool first_call = true;
-            if (first_call) {
-                hal.console->printf("DDE-TX: Feature 3 - Encryption MAVLink PAYLOAD activée\n");
-                first_call = false;
-            }
-
             // Buffer pour payload chiffré
-            uint8_t encrypted[len];
+            uint8_t encrypted[256];
 
             // Nonce déterministe basé sur les champs du header
-            // Doit correspondre au RX pour décryption
             uint8_t nonce[12];
             nonce[0] = tx_header_info[chan].seq;
             nonce[1] = tx_header_info[chan].sysid;
@@ -226,22 +242,20 @@ void comm_send_buffer(mavlink_channel_t chan, const uint8_t *buf, uint8_t len)
             nonce[3] = (tx_header_info[chan].msgid >> 0) & 0xFF;
             nonce[4] = (tx_header_info[chan].msgid >> 8) & 0xFF;
             nonce[5] = (tx_header_info[chan].msgid >> 16) & 0xFF;
-            nonce[6] = chan;  // Channel ID
-            nonce[7] = 0x00;  // Direction: TX=0
+            nonce[6] = chan;
+            nonce[7] = 0x00;
             nonce[8] = 0x00;
             nonce[9] = 0x00;
             nonce[10] = 0x00;
             nonce[11] = 0x00;
 
-            // Chiffrer SEULEMENT le payload avec ChaCha20-256
+            // Chiffrer le payload avec ChaCha20-256
             ChaCha20XOR((uint8_t*)dek, 0, nonce, (uint8_t*)buf, encrypted, len);
 
-            // Debug: log périodique
-            static uint32_t debug_count = 0;
-            if (++debug_count % 100 == 1) {
-                hal.console->printf("DDE-TX: Encrypted msg %lu (%u bytes) seq=%u\n",
-                       (unsigned long)tx_header_info[chan].msgid, len, tx_header_info[chan].seq);
-            }
+            // Session 21: Store ciphertext for CRC recalculation in buffer[2]
+            memcpy(stored_ciphertext[chan], encrypted, len);
+            stored_ciphertext_len[chan] = len;
+            was_encrypted[chan] = true;
 
             // Envoyer payload chiffré
             const size_t written = mavlink_comm_port[chan]->write(encrypted, len);
@@ -252,21 +266,55 @@ void comm_send_buffer(mavlink_channel_t chan, const uint8_t *buf, uint8_t len)
 #else
             (void)written;
 #endif
-            // Incrémenter index, invalider header info et sortir
             send_buffer_index[chan]++;
-            tx_header_info[chan].valid = false;
             return;
-        } else {
-            // DEK non disponible: avertissement et envoi plaintext
-            static bool warned = false;
-            if (!warned) {
-                hal.console->printf("DDE-TX: WARNING - Encryption enabled but DEK not available\n");
-                warned = true;
-            }
         }
+        // else: DEK not available, continue with plaintext
     }
 
-    // Incrémenter index pour prochain buffer (header/checksum/signature en clair)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Buffer[2] = Checksum: Recalculate CRC on ciphertext if payload was encrypted
+    // ═══════════════════════════════════════════════════════════════════════
+    if (is_checksum && was_encrypted[chan] && len == 2) {
+        // Recalculate CRC on: header (bytes 1-9, without STX) + ciphertext + crc_extra
+        uint16_t crc;
+        crc_init(&crc);
+
+        // CRC over header bytes 1-9 (skip STX at byte 0)
+        for (int i = 1; i < 10; i++) {
+            crc_accumulate(stored_header[chan][i], &crc);
+        }
+
+        // CRC over ciphertext (not plaintext!)
+        crc_accumulate_buffer(&crc, (const char*)stored_ciphertext[chan], stored_ciphertext_len[chan]);
+
+        // CRC extra depends on msgid - lookup in MAVLink message table
+        const mavlink_msg_entry_t* entry = mavlink_get_msg_entry(tx_header_info[chan].msgid);
+        if (entry != nullptr) {
+            crc_accumulate(entry->crc_extra, &crc);
+        }
+
+        // Build new CRC bytes
+        uint8_t new_ck[2];
+        new_ck[0] = (uint8_t)(crc & 0xFF);
+        new_ck[1] = (uint8_t)(crc >> 8);
+
+        // Send recalculated CRC instead of original
+        const size_t written = mavlink_comm_port[chan]->write(new_ck, 2);
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+        if (written < 2 && !mavlink_comm_port[chan]->is_write_locked()) {
+            AP_HAL::panic("Short write on UART: %lu < 2", (unsigned long)written);
+        }
+#else
+        (void)written;
+#endif
+        // Reset encryption flag and increment buffer index
+        was_encrypted[chan] = false;
+        send_buffer_index[chan]++;
+        return;
+    }
+
+    // Incrémenter index pour prochain buffer (header/plaintext checksum/signature)
     send_buffer_index[chan]++;
 #endif // AP_HSM_ENABLED
 

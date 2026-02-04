@@ -15,6 +15,18 @@
 
 extern const AP_HAL::HAL& hal;
 
+// Session 21: Disable verbose console output in SITL to avoid MAVLink stream corruption
+#include "AP_HSM.h"
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+  #if AP_HSM_MOCK_ENABLED
+    #define DDE_DEBUG(fmt, ...) do { /* disabled in SITL Mock */ } while(0)
+  #else
+    #define DDE_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+  #endif
+#else
+  #define DDE_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+#endif
+
 // Singleton instance
 DualDekEngine* DualDekEngine::_singleton = nullptr;
 
@@ -26,7 +38,7 @@ DualDekEngine::DualDekEngine()
 bool DualDekEngine::init(KeyOrchestrator* ko, KeyExchangeProtocol* kep)
 {
     if (ko == nullptr) {
-        hal.console->printf("DDE: ERROR - KeyOrchestrator is null\n");
+        DDE_DEBUG("DDE: ERROR - KeyOrchestrator is null\n");
         return false;
     }
 
@@ -36,10 +48,10 @@ bool DualDekEngine::init(KeyOrchestrator* ko, KeyExchangeProtocol* kep)
     // Check if we have our DEK ready
     if (_ko->get_my_dek() != nullptr) {
         _ready = true;
-        hal.console->printf("DDE: Initialized - MY_DEK ready for encryption\n");
+        DDE_DEBUG("DDE: Initialized - MY_DEK ready for encryption\n");
     } else {
         _ready = false;
-        hal.console->printf("DDE: Initialized - waiting for DEK\n");
+        DDE_DEBUG("DDE: Initialized - waiting for DEK\n");
     }
 
     return true;
@@ -69,13 +81,13 @@ bool DualDekEngine::encrypt_payload(const uint8_t* plaintext, size_t plaintext_l
                                      uint8_t* ciphertext, size_t* ciphertext_len)
 {
     if (!_ready || _ko == nullptr) {
-        hal.console->printf("DDE: Cannot encrypt - not ready\n");
+        DDE_DEBUG("DDE: Cannot encrypt - not ready\n");
         return false;
     }
 
     const uint8_t* my_dek = _ko->get_my_dek();
     if (my_dek == nullptr) {
-        hal.console->printf("DDE: Cannot encrypt - DEK not available\n");
+        DDE_DEBUG("DDE: Cannot encrypt - DEK not available\n");
         return false;
     }
 
@@ -84,7 +96,7 @@ bool DualDekEngine::encrypt_payload(const uint8_t* plaintext, size_t plaintext_l
     }
 
     if (plaintext_len > DDE_MAX_PAYLOAD) {
-        hal.console->printf("DDE: Payload too large (%u > %d)\n",
+        DDE_DEBUG("DDE: Payload too large (%u > %d)\n",
                            (unsigned)plaintext_len, DDE_MAX_PAYLOAD);
         return false;
     }
@@ -112,7 +124,7 @@ bool DualDekEngine::decrypt_payload(uint8_t src_sysid,
                                      uint8_t* plaintext, size_t* plaintext_len)
 {
     if (_kep == nullptr) {
-        hal.console->printf("DDE: Cannot decrypt - KEP not available\n");
+        DDE_DEBUG("DDE: Cannot decrypt - KEP not available\n");
         _stats.rx_failed++;
         return false;
     }
@@ -123,7 +135,7 @@ bool DualDekEngine::decrypt_payload(uint8_t src_sysid,
     }
 
     if (ciphertext_len <= DDE_HEADER_SIZE) {
-        hal.console->printf("DDE: Ciphertext too short (%u <= %d)\n",
+        DDE_DEBUG("DDE: Ciphertext too short (%u <= %d)\n",
                            (unsigned)ciphertext_len, DDE_HEADER_SIZE);
         _stats.rx_failed++;
         return false;
@@ -133,7 +145,7 @@ bool DualDekEngine::decrypt_payload(uint8_t src_sysid,
     const uint8_t* peer_dek = _kep->get_peer_dek(src_sysid, 0);  // compid=0 for any
     if (peer_dek == nullptr) {
         // No DEK for this peer - might be unencrypted message
-        hal.console->printf("DDE: No DEK for sysid=%d\n", src_sysid);
+        DDE_DEBUG("DDE: No DEK for sysid=%d\n", src_sysid);
         _stats.rx_failed++;
         return false;
     }
@@ -149,7 +161,7 @@ bool DualDekEngine::decrypt_payload(uint8_t src_sysid,
     int result = crypto_unlock(plaintext, peer_dek, nonce, tag, ct, ct_len);
 
     if (result != 0) {
-        hal.console->printf("DDE: Decryption failed - auth error (sysid=%d)\n", src_sysid);
+        DDE_DEBUG("DDE: Decryption failed - auth error (sysid=%d)\n", src_sysid);
         _stats.rx_failed++;
         return false;
     }
@@ -162,11 +174,11 @@ bool DualDekEngine::decrypt_payload(uint8_t src_sysid,
 
 void DualDekEngine::print_status()
 {
-    hal.console->printf("DDE: STATUS\n");
-    hal.console->printf("DDE:   Ready: %s\n", _ready ? "YES" : "NO");
-    hal.console->printf("DDE:   TX encrypted: %lu\n", (unsigned long)_stats.tx_encrypted);
-    hal.console->printf("DDE:   TX plaintext: %lu\n", (unsigned long)_stats.tx_plaintext);
-    hal.console->printf("DDE:   RX decrypted: %lu\n", (unsigned long)_stats.rx_decrypted);
-    hal.console->printf("DDE:   RX failed:    %lu\n", (unsigned long)_stats.rx_failed);
-    hal.console->printf("DDE:   RX plaintext: %lu\n", (unsigned long)_stats.rx_plaintext);
+    DDE_DEBUG("DDE: STATUS\n");
+    DDE_DEBUG("DDE:   Ready: %s\n", _ready ? "YES" : "NO");
+    DDE_DEBUG("DDE:   TX encrypted: %lu\n", (unsigned long)_stats.tx_encrypted);
+    DDE_DEBUG("DDE:   TX plaintext: %lu\n", (unsigned long)_stats.tx_plaintext);
+    DDE_DEBUG("DDE:   RX decrypted: %lu\n", (unsigned long)_stats.rx_decrypted);
+    DDE_DEBUG("DDE:   RX failed:    %lu\n", (unsigned long)_stats.rx_failed);
+    DDE_DEBUG("DDE:   RX plaintext: %lu\n", (unsigned long)_stats.rx_plaintext);
 }

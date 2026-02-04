@@ -6,6 +6,20 @@
 
 #include <cctype>
 
+// Session 21: Mock debug output macro
+// In SITL, hal.console writes to MAVLink TCP port, corrupting the stream
+// Use printf() in SITL (goes to stdout) and hal.console on Pixhawk
+#if AP_HSM_MOCK_ENABLED
+  #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    // Disable verbose Mock output in SITL to avoid MAVLink corruption
+    #define MOCK_DEBUG(fmt, ...) do { /* disabled */ } while(0)
+  #else
+    #define MOCK_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+  #endif
+#else
+  #define MOCK_DEBUG(fmt, ...) do { /* not mock mode */ } while(0)
+#endif
+
 // Feature 2: micro-ecc pour génération keypair P-256
 #include "uECC.h"
 
@@ -57,7 +71,10 @@ void AP_HSM::begin(AP_HAL::UARTDriver* uart_dev) {
 #if AP_HSM_MOCK_ENABLED
     // Mock mode: no UART needed
     (void)uart_dev;  // Suppress unused parameter warning
-    hal.console->printf("HSM: [MOCK MODE] Skipping UART initialization\n");
+    // Note: Use printf() in SITL to avoid corrupting MAVLink stream (hal.console = SERIAL0 = TCP 5760)
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    printf("HSM: [MOCK MODE] Skipping UART initialization\n");
+#endif
     return;
 #else
     if (uart_dev == nullptr) {
@@ -87,14 +104,10 @@ void AP_HSM::begin(AP_HAL::UARTDriver* uart_dev) {
 bool AP_HSM::init_monolith() {
 #if AP_HSM_MOCK_ENABLED
     // Mock mode: simulate successful HSM initialization
-    hal.console->printf("HSM: [MOCK MODE] ═══════════════════════════════════════════\n");
-    hal.console->printf("HSM: [MOCK MODE] Simulating HSM initialization...\n");
-    hal.console->printf("HSM: [MOCK MODE] SE désactivé (simulated)\n");
-    hal.console->printf("HSM: [MOCK MODE] SE activé (simulated)\n");
-    hal.console->printf("HSM: [MOCK MODE] Application CC sélectionnée (simulated)\n");
-    hal.console->printf("HSM: [MOCK MODE] PIN User vérifié (simulated)\n");
-    hal.console->printf("HSM: [MOCK MODE] ✓ Initialisation Mock HSM terminée!\n");
-    hal.console->printf("HSM: [MOCK MODE] ═══════════════════════════════════════════\n");
+    // Note: Use printf() in SITL to avoid corrupting MAVLink stream
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+    printf("HSM: [MOCK] Init complete\n");
+#endif
     _mock_initialized = true;
     _init_state = InitState::COMPLETE;
     return true;

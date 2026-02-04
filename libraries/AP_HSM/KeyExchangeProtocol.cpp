@@ -20,6 +20,19 @@ extern "C" {
 
 extern const AP_HAL::HAL& hal;
 
+// Session 21: Disable verbose console output in SITL to avoid MAVLink stream corruption
+// Note: AP_HSM.h defines AP_HSM_MOCK_ENABLED
+#include "AP_HSM.h"
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+  #if AP_HSM_MOCK_ENABLED
+    #define KEP_DEBUG(fmt, ...) do { /* disabled in SITL Mock */ } while(0)
+  #else
+    #define KEP_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+  #endif
+#else
+  #define KEP_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+#endif
+
 // ECIES constants (must match Python implementation)
 static const uint8_t ECIES_SALT[] = "ECIES-Salt";
 static const uint8_t ECIES_INFO[] = "DEK-Encryption-v1";
@@ -51,34 +64,34 @@ KeyExchangeProtocol::KeyExchangeProtocol()
 
 bool KeyExchangeProtocol::init(KeyOrchestrator* key_orch)
 {
-    hal.console->printf("KEP::init called\n");
+    KEP_DEBUG("KEP::init called\n");
 
     if (key_orch == nullptr) {
-        hal.console->printf("KEP: ERROR - KeyOrchestrator is null\n");
+        KEP_DEBUG("KEP: ERROR - KeyOrchestrator is null\n");
         return false;
     }
 
     _key_orch = key_orch;
 
     // Get our WK public from KeyOrchestrator
-    hal.console->printf("KEP: Getting WK public from KeyOrchestrator...\n");
+    KEP_DEBUG("KEP: Getting WK public from KeyOrchestrator...\n");
     const uint8_t* wk_pub = _key_orch->get_wk_public();
 
     if (wk_pub == nullptr) {
-        hal.console->printf("KEP: ERROR - get_wk_public() returned NULL!\n");
-        hal.console->printf("KEP: This means _wk_loaded is false in KeyOrchestrator\n");
+        KEP_DEBUG("KEP: ERROR - get_wk_public() returned NULL!\n");
+        KEP_DEBUG("KEP: This means _wk_loaded is false in KeyOrchestrator\n");
         return false;
     }
 
     // Debug: show what we're copying
-    hal.console->printf("KEP: Source WK from KO: %02X%02X%02X%02X...\n",
+    KEP_DEBUG("KEP: Source WK from KO: %02X%02X%02X%02X...\n",
            wk_pub[0], wk_pub[1], wk_pub[2], wk_pub[3]);
 
     memcpy(_my_wk_public, wk_pub, KEP_PUBKEY_SIZE);
     _wk_public_ready = true;
 
     // Debug: verify copy
-    hal.console->printf("KEP: After copy, _my_wk_public: %02X%02X%02X%02X...\n",
+    KEP_DEBUG("KEP: After copy, _my_wk_public: %02X%02X%02X%02X...\n",
            _my_wk_public[0], _my_wk_public[1], _my_wk_public[2], _my_wk_public[3]);
 
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK ready %02X%02X%02X%02X",
@@ -124,7 +137,7 @@ KeyExchangeProtocol::PeerInfo* KeyExchangeProtocol::add_peer(uint8_t sysid, uint
         }
     }
 
-    hal.console->printf("KEP: ERROR - Max peers reached (%d)\n", KEP_MAX_PEERS);
+    KEP_DEBUG("KEP: ERROR - Max peers reached (%d)\n", KEP_MAX_PEERS);
     return nullptr;
 }
 
@@ -144,14 +157,14 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
     static uint32_t hb_count = 0;
     hb_count++;
     if (hb_count <= 3 || hb_count % 100 == 0) {
-        hal.console->printf("KEP: on_heartbeat_received(%d, %d) #%lu my_sysid=%d\n",
+        KEP_DEBUG("KEP: on_heartbeat_received(%d, %d) #%lu my_sysid=%d\n",
                sysid, compid, (unsigned long)hb_count, _my_sysid);
         
     }
 
     // Ignore our own heartbeat
     if (sysid == _my_sysid && compid == _my_compid) {
-        hal.console->printf("KEP: Ignoring own heartbeat (sysid=%d)\n", sysid);
+        KEP_DEBUG("KEP: Ignoring own heartbeat (sysid=%d)\n", sysid);
         
         return;
     }
@@ -160,20 +173,20 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
 
     if (peer == nullptr) {
         // New peer detected
-        hal.console->printf("KEP: NEW PEER detected sysid=%d compid=%d\n", sysid, compid);
+        KEP_DEBUG("KEP: NEW PEER detected sysid=%d compid=%d\n", sysid, compid);
         
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: New peer sysid=%d compid=%d",
                       sysid, compid);
 
         peer = add_peer(sysid, compid);
         if (peer != nullptr) {
-            hal.console->printf("KEP: Peer added, initiating exchange...\n");
+            KEP_DEBUG("KEP: Peer added, initiating exchange...\n");
             
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Initiating exchange");
             // Initiate exchange automatically
             initiate_exchange(sysid, compid);
         } else {
-            hal.console->printf("KEP: ERROR - Failed to add peer!\n");
+            KEP_DEBUG("KEP: ERROR - Failed to add peer!\n");
             
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "KEP: Failed to add peer");
         }
@@ -189,7 +202,7 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
              peer->state == State::DEK_SENT ||
              peer->state == State::DEK_RECEIVED)) {
 
-            hal.console->printf("KEP: Resetting peer sysid=%d (inactive %lums)\n",
+            KEP_DEBUG("KEP: Resetting peer sysid=%d (inactive %lums)\n",
                    sysid, (unsigned long)inactive_time);
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Peer %d reset for re-exchange", sysid);
 
@@ -203,7 +216,7 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
 
         // If peer is IDLE (just reset or was already idle), re-initiate exchange
         if (peer->state == State::IDLE && _wk_public_ready) {
-            hal.console->printf("KEP: Re-initiating exchange with peer sysid=%d\n", sysid);
+            KEP_DEBUG("KEP: Re-initiating exchange with peer sysid=%d\n", sysid);
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Re-exchange with peer %d", sysid);
             initiate_exchange(sysid, compid);
         }
@@ -220,14 +233,14 @@ void KeyExchangeProtocol::on_heartbeat_received(uint8_t sysid, uint8_t compid)
 
 bool KeyExchangeProtocol::initiate_exchange(uint8_t peer_sysid, uint8_t peer_compid)
 {
-    hal.console->printf("KEP: initiate_exchange(%d, %d) wk_ready=%d\n",
+    KEP_DEBUG("KEP: initiate_exchange(%d, %d) wk_ready=%d\n",
            peer_sysid, peer_compid, _wk_public_ready);
     
 
     if (!_wk_public_ready) {
-        hal.console->printf("KEP: ERROR - WK not initialized!\n");
+        KEP_DEBUG("KEP: ERROR - WK not initialized!\n");
         
-        hal.console->printf("KEP: ERROR - WK not initialized\n");
+        KEP_DEBUG("KEP: ERROR - WK not initialized\n");
         return false;
     }
 
@@ -235,7 +248,7 @@ bool KeyExchangeProtocol::initiate_exchange(uint8_t peer_sysid, uint8_t peer_com
     if (peer == nullptr) {
         peer = add_peer(peer_sysid, peer_compid);
         if (peer == nullptr) {
-            hal.console->printf("KEP: ERROR - Cannot add peer\n");
+            KEP_DEBUG("KEP: ERROR - Cannot add peer\n");
             
             return false;
         }
@@ -245,12 +258,12 @@ bool KeyExchangeProtocol::initiate_exchange(uint8_t peer_sysid, uint8_t peer_com
     if (send_wk_exchange(peer_sysid, peer_compid)) {
         peer->state = State::WK_SENT;
         peer->last_activity_ms = AP_HAL::millis();
-        hal.console->printf("KEP: ✓ Exchange initiated, state=WK_SENT\n");
+        KEP_DEBUG("KEP: ✓ Exchange initiated, state=WK_SENT\n");
         
         return true;
     }
 
-    hal.console->printf("KEP: ERROR - send_wk_exchange failed\n");
+    KEP_DEBUG("KEP: ERROR - send_wk_exchange failed\n");
     
     return false;
 }
@@ -279,9 +292,9 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
     uint8_t mask = GCS_MAVLINK::active_channel_mask();
     uint32_t timestamp = AP_HAL::millis();
 
-    hal.console->printf("KEP: >>> send_wk_exchange() called for sysid=%d <<<\n", target_sysid);
-    hal.console->printf("KEP: send_wk_exchange to sysid=%d, chan_mask=0x%02X\n", target_sysid, mask);
-    hal.console->printf("KEP: WK public: %02X%02X%02X%02X...\n",
+    KEP_DEBUG("KEP: >>> send_wk_exchange() called for sysid=%d <<<\n", target_sysid);
+    KEP_DEBUG("KEP: send_wk_exchange to sysid=%d, chan_mask=0x%02X\n", target_sysid, mask);
+    KEP_DEBUG("KEP: WK public: %02X%02X%02X%02X...\n",
            _my_wk_public[0], _my_wk_public[1], _my_wk_public[2], _my_wk_public[3]);
     
 
@@ -291,7 +304,7 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
                   _my_wk_public[0], _my_wk_public[1], _my_wk_public[2], _my_wk_public[3]);
 
     if (mask == 0) {
-        hal.console->printf("KEP: ERROR - No active MAVLink channels!\n");
+        KEP_DEBUG("KEP: ERROR - No active MAVLink channels!\n");
         
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "KEP: No active channels!");
         return false;
@@ -306,7 +319,7 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
         }
     }
     if (wk_all_zeros) {
-        hal.console->printf("KEP: ERROR - _my_wk_public is ALL ZEROS! KEP init failed?\n");
+        KEP_DEBUG("KEP: ERROR - _my_wk_public is ALL ZEROS! KEP init failed?\n");
         GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "KEP: WK is ZEROS!");
         return false;
     }
@@ -315,7 +328,7 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
     for (uint8_t i = 0; i < MAVLINK_COMM_NUM_BUFFERS; i++) {
         if (mask & (1U << i)) {
             mavlink_channel_t chan = (mavlink_channel_t)(MAVLINK_COMM_0 + i);
-            hal.console->printf("KEP: Sending HSM_WK_EXCHANGE on chan %d\n", i);
+            KEP_DEBUG("KEP: Sending HSM_WK_EXCHANGE on chan %d\n", i);
 
             mavlink_msg_hsm_wk_exchange_send(chan, target_sysid, target_compid,
                                              _my_wk_public, timestamp);
@@ -323,7 +336,7 @@ bool KeyExchangeProtocol::send_wk_exchange(uint8_t target_sysid, uint8_t target_
         }
     }
 
-    hal.console->printf("KEP: ✓ WK_EXCHANGE sent on %d channels\n", sent);
+    KEP_DEBUG("KEP: ✓ WK_EXCHANGE sent on %d channels\n", sent);
 
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK sent on %d channels", sent);
     return true;
@@ -372,7 +385,7 @@ bool KeyExchangeProtocol::send_dek_exchange(PeerInfo* peer)
 bool KeyExchangeProtocol::send_key_ack(uint8_t target_sysid, uint8_t target_compid,
                                         AckStatus status, AckPhase phase)
 {
-    hal.console->printf("KEP: KEY_ACK -> sysid=%d status=%d phase=%d\n",
+    KEP_DEBUG("KEP: KEY_ACK -> sysid=%d status=%d phase=%d\n",
            target_sysid, (int)status, (int)phase);
 
     // Send on all active MAVLink channels
@@ -398,19 +411,19 @@ void KeyExchangeProtocol::handle_wk_exchange(uint8_t src_sysid, uint8_t src_comp
                                               const uint8_t wk_pub[KEP_PUBKEY_SIZE],
                                               uint32_t timestamp)
 {
-    hal.console->printf("KEP: handle_wk_exchange from sysid=%d compid=%d\n", src_sysid, src_compid);
-    hal.console->printf("KEP:   WK: %02X%02X%02X%02X...\n", wk_pub[0], wk_pub[1], wk_pub[2], wk_pub[3]);
+    KEP_DEBUG("KEP: handle_wk_exchange from sysid=%d compid=%d\n", src_sysid, src_compid);
+    KEP_DEBUG("KEP:   WK: %02X%02X%02X%02X...\n", wk_pub[0], wk_pub[1], wk_pub[2], wk_pub[3]);
     
 
     PeerInfo* peer = find_peer(src_sysid, src_compid);
     if (peer == nullptr) {
-        hal.console->printf("KEP: Adding new peer for WK exchange\n");
+        KEP_DEBUG("KEP: Adding new peer for WK exchange\n");
         
         peer = add_peer(src_sysid, src_compid);
     }
 
     if (peer == nullptr) {
-        hal.console->printf("KEP: ERROR - Could not add peer!\n");
+        KEP_DEBUG("KEP: ERROR - Could not add peer!\n");
         
         return;
     }
@@ -420,7 +433,7 @@ void KeyExchangeProtocol::handle_wk_exchange(uint8_t src_sysid, uint8_t src_comp
     peer->wk_received = true;
     peer->last_activity_ms = AP_HAL::millis();
 
-    hal.console->printf("KEP: ✓ Stored peer WK, state=%d, wk_public_ready=%d\n",
+    KEP_DEBUG("KEP: ✓ Stored peer WK, state=%d, wk_public_ready=%d\n",
            (int)peer->state, _wk_public_ready);
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK stored state=%d wk_ready=%d", (int)peer->state, _wk_public_ready);
 
@@ -429,11 +442,11 @@ void KeyExchangeProtocol::handle_wk_exchange(uint8_t src_sysid, uint8_t src_comp
     // This handles race conditions where our first WK might have been lost
     // (e.g., sent via initiate_exchange before GCS was ready to receive)
     if (peer->state == State::IDLE || peer->state == State::WK_SENT) {
-        hal.console->printf("KEP: Sending our WK in response (state=%d)...\n", (int)peer->state);
+        KEP_DEBUG("KEP: Sending our WK in response (state=%d)...\n", (int)peer->state);
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Sending WK response (state=%d)", (int)peer->state);
 
         if (!send_wk_exchange(src_sysid, src_compid)) {
-            hal.console->printf("KEP: WARNING - send_wk_exchange failed!\n");
+            KEP_DEBUG("KEP: WARNING - send_wk_exchange failed!\n");
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "KEP: send_wk_exchange FAILED!");
         } else {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: WK sent OK");
@@ -447,12 +460,12 @@ void KeyExchangeProtocol::handle_wk_exchange(uint8_t src_sysid, uint8_t src_comp
 
     // If WK exchanged both ways, proceed to DEK
     if (peer->state == State::WK_SENT && peer->wk_received) {
-        hal.console->printf("KEP: WK exchange complete, sending DEK...\n");
+        KEP_DEBUG("KEP: WK exchange complete, sending DEK...\n");
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Sending DEK...");
 
         peer->state = State::WK_RECEIVED;
         if (!send_dek_exchange(peer)) {
-            hal.console->printf("KEP: WARNING - send_dek_exchange failed!\n");
+            KEP_DEBUG("KEP: WARNING - send_dek_exchange failed!\n");
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "KEP: send_dek_exchange FAILED!");
         } else {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: DEK sent OK");
@@ -461,7 +474,7 @@ void KeyExchangeProtocol::handle_wk_exchange(uint8_t src_sysid, uint8_t src_comp
     }
 
     // Send ACK
-    hal.console->printf("KEP: Sending KEY_ACK for WK\n");
+    KEP_DEBUG("KEP: Sending KEY_ACK for WK\n");
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Sending KEY_ACK");
     
     send_key_ack(src_sysid, src_compid, AckStatus::SUCCESS, AckPhase::WK_RECEIVED);
@@ -475,7 +488,7 @@ void KeyExchangeProtocol::handle_dek_exchange(uint8_t src_sysid, uint8_t src_com
 {
     PeerInfo* peer = find_peer(src_sysid, src_compid);
     if (peer == nullptr) {
-        hal.console->printf("KEP: ERROR - DEK from unknown peer sysid=%d\n", src_sysid);
+        KEP_DEBUG("KEP: ERROR - DEK from unknown peer sysid=%d\n", src_sysid);
         return;
     }
 
@@ -483,7 +496,7 @@ void KeyExchangeProtocol::handle_dek_exchange(uint8_t src_sysid, uint8_t src_com
     uint8_t decrypted_dek[KEP_KEY_SIZE];
 
     if (!ecies_decrypt_dek(ephemeral_pub, encrypted_dek, nonce, tag, decrypted_dek)) {
-        hal.console->printf("KEP: ERROR - ECIES decryption failed\n");
+        KEP_DEBUG("KEP: ERROR - ECIES decryption failed\n");
         send_key_ack(src_sysid, src_compid, AckStatus::DEK_ERROR, AckPhase::DEK_RECEIVED);
         return;
     }
@@ -493,7 +506,7 @@ void KeyExchangeProtocol::handle_dek_exchange(uint8_t src_sysid, uint8_t src_com
     peer->dek_received = true;
     peer->last_activity_ms = AP_HAL::millis();
 
-    hal.console->printf("KEP: DEK <- sysid=%d: %02X%02X%02X%02X...\n",
+    KEP_DEBUG("KEP: DEK <- sysid=%d: %02X%02X%02X%02X...\n",
            src_sysid, decrypted_dek[0], decrypted_dek[1], decrypted_dek[2], decrypted_dek[3]);
 
     // Clear sensitive data
@@ -502,7 +515,7 @@ void KeyExchangeProtocol::handle_dek_exchange(uint8_t src_sysid, uint8_t src_com
     // Check if exchange complete
     if (peer->state == State::DEK_SENT && peer->dek_received) {
         peer->state = State::COMPLETE;
-        hal.console->printf("KEP: Exchange COMPLETE with sysid=%d\n", src_sysid);
+        KEP_DEBUG("KEP: Exchange COMPLETE with sysid=%d\n", src_sysid);
     }
 
     // Send ACK
@@ -519,11 +532,11 @@ void KeyExchangeProtocol::handle_key_ack(uint8_t src_sysid, uint8_t src_compid,
 
     peer->last_activity_ms = AP_HAL::millis();
 
-    hal.console->printf("KEP: KEY_ACK <- sysid=%d status=%d phase=%d\n",
+    KEP_DEBUG("KEP: KEY_ACK <- sysid=%d status=%d phase=%d\n",
            src_sysid, status, phase);
 
     if (status != (uint8_t)AckStatus::SUCCESS) {
-        hal.console->printf("KEP: WARNING - Peer reported error: %d\n", status);
+        KEP_DEBUG("KEP: WARNING - Peer reported error: %d\n", status);
         peer->state = State::ERROR;
     }
 }
@@ -608,13 +621,13 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
     // 1. Get our WK private from KeyOrchestrator
     const uint8_t* my_wk_priv = _key_orch->get_wk_private();
     if (my_wk_priv == nullptr) {
-        hal.console->printf("KEP: ERROR - WK private not available\n");
+        KEP_DEBUG("KEP: ERROR - WK private not available\n");
         return false;
     }
 
     // 2. ECDH: shared_secret = my_wk_priv * ephemeral_pub
     if (!ecdh_compute_shared(my_wk_priv, ephemeral_pub, shared_secret)) {
-        hal.console->printf("KEP: ERROR - ECDH decryption failed\n");
+        KEP_DEBUG("KEP: ERROR - ECDH decryption failed\n");
         return false;
     }
 
@@ -628,7 +641,7 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
     // 4. Decrypt with ChaCha20-Poly1305
     if (!chacha_decrypt(encryption_key, nonce, encrypted_dek, KEP_KEY_SIZE,
                         tag, dek_out)) {
-        hal.console->printf("KEP: ERROR - ChaCha20 decryption failed (auth error)\n");
+        KEP_DEBUG("KEP: ERROR - ChaCha20 decryption failed (auth error)\n");
         secure_zero(shared_secret, 32);
         secure_zero(encryption_key, 32);
         return false;
@@ -638,7 +651,7 @@ bool KeyExchangeProtocol::ecies_decrypt_dek(const uint8_t ephemeral_pub[KEP_PUBK
     secure_zero(shared_secret, 32);
     secure_zero(encryption_key, 32);
 
-    hal.console->printf("KEP: ECIES decryption OK\n");
+    KEP_DEBUG("KEP: ECIES decryption OK\n");
     return true;
 }
 
@@ -693,7 +706,7 @@ bool KeyExchangeProtocol::chacha_decrypt(const uint8_t* key,
     // crypto_unlock(plain_text, key, nonce, mac, cipher_text, text_size)
     int result = crypto_unlock(plaintext, key, nonce, tag, ciphertext, ciphertext_len);
     if (result != 0) {
-        hal.console->printf("KEP: crypto_unlock failed - authentication error\n");
+        KEP_DEBUG("KEP: crypto_unlock failed - authentication error\n");
         return false;
     }
     return true;
@@ -766,7 +779,7 @@ void KeyExchangeProtocol::check_timeouts()
             _peers[i].state == State::DEK_RECEIVED) {
 
             if (inactive_time > KEP_PEER_RESET_TIMEOUT_MS) {
-                hal.console->printf("KEP: Resetting peer sysid=%d (inactive %lums)\n",
+                KEP_DEBUG("KEP: Resetting peer sysid=%d (inactive %lums)\n",
                        _peers[i].sysid, (unsigned long)inactive_time);
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "KEP: Peer %d reset for re-exchange", _peers[i].sysid);
 
@@ -785,7 +798,7 @@ void KeyExchangeProtocol::check_timeouts()
             _peers[i].state != State::ERROR) {
 
             if (inactive_time > KEP_EXCHANGE_TIMEOUT_MS) {
-                hal.console->printf("KEP: TIMEOUT - sysid=%d\n", _peers[i].sysid);
+                KEP_DEBUG("KEP: TIMEOUT - sysid=%d\n", _peers[i].sysid);
                 _peers[i].state = State::ERROR;
             }
         }
@@ -799,6 +812,8 @@ void KeyExchangeProtocol::check_timeouts()
 
 void KeyExchangeProtocol::print_status()
 {
+    // Session 21: Disable status print in SITL Mock to avoid MAVLink stream corruption
+#if !(CONFIG_HAL_BOARD == HAL_BOARD_SITL && AP_HSM_MOCK_ENABLED)
     hal.console->printf("\nKEP: === Key Exchange Protocol Status ===\n");
     hal.console->printf("KEP:   WK public ready: %s\n", _wk_public_ready ? "YES" : "NO");
     hal.console->printf("KEP:   Peers: %d/%d\n", _num_peers, KEP_MAX_PEERS);
@@ -822,4 +837,5 @@ void KeyExchangeProtocol::print_status()
                    _peers[i].wk_received, _peers[i].dek_received);
         }
     }
+#endif
 }

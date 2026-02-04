@@ -1927,6 +1927,55 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
         // Try to get a new message
         const uint8_t framing = mavlink_frame_char_buffer(channel_buffer(), channel_status(), c, &msg, &status);
         if (framing == MAVLINK_FRAMING_OK) {
+#if AP_HSM_ENABLED
+            // ═══════════════════════════════════════════════════════════════════
+            // Session 21 CRC Fix: Decrypt AFTER CRC validation (not on BAD_CRC)
+            // ═══════════════════════════════════════════════════════════════════
+            // With CRC Fix, TX sends CRC calculated on ciphertext, so RX receives
+            // MAVLINK_FRAMING_OK for encrypted messages. We decrypt here.
+            //
+            // Messages that should NOT be decrypted (plaintext):
+            // - HEARTBEAT (0), HSM_WK_EXCHANGE (12000), HSM_DEK_EXCHANGE (12001), HSM_KEY_ACK (12002)
+
+            const bool is_plaintext_msg = (msg.msgid == 0 || msg.msgid == 12000 ||
+                                           msg.msgid == 12001 || msg.msgid == 12002);
+
+            if (gcs().get_mav_encrypt() != 0 && !is_plaintext_msg && msg.len > 0) {
+                KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+                const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
+
+                if (peer_dek != nullptr) {
+                    // Reconstruct the same nonce as TX
+                    uint8_t nonce[12];
+                    nonce[0] = msg.seq;
+                    nonce[1] = msg.sysid;
+                    nonce[2] = msg.compid;
+                    nonce[3] = (msg.msgid >> 0) & 0xFF;
+                    nonce[4] = (msg.msgid >> 8) & 0xFF;
+                    nonce[5] = (msg.msgid >> 16) & 0xFF;
+                    nonce[6] = chan;
+                    nonce[7] = 0x00;
+                    nonce[8] = 0x00;
+                    nonce[9] = 0x00;
+                    nonce[10] = 0x00;
+                    nonce[11] = 0x00;
+
+                    // Decrypt payload in-place
+                    uint8_t decrypted[MAVLINK_MAX_PAYLOAD_LEN];
+                    ChaCha20XOR((uint8_t*)peer_dek, 0, nonce, (uint8_t*)msg.payload64, decrypted, msg.len);
+                    memcpy((void*)msg.payload64, decrypted, msg.len);
+
+                    // Debug log (periodic)
+                    static uint32_t rx_decrypt_count = 0;
+                    if (++rx_decrypt_count % 50 == 1) {
+                        hal.console->printf("DDE-RX: [CRC OK] Decrypted msg %u from sysid=%u (%u bytes)\n",
+                               msg.msgid, msg.sysid, msg.len);
+                    }
+                }
+                // If no peer DEK, message passes through as-is (might be from non-HSM peer)
+            }
+#endif // AP_HSM_ENABLED
+
             hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
             packetReceived(status, msg);
             parsed_packet = true;
@@ -1937,55 +1986,57 @@ GCS_MAVLINK::update_receive(uint32_t max_time_us)
         }
 #if AP_HSM_ENABLED
         else if (framing == MAVLINK_FRAMING_BAD_CRC && gcs().get_mav_encrypt() != 0) {
-            // Feature 3: CRC fails because payload was encrypted
-            // Decrypt and process the message anyway
-            KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+            // ═══════════════════════════════════════════════════════════════════
+            // LEGACY FALLBACK: Handle messages from peers without CRC Fix
+            // ═══════════════════════════════════════════════════════════════════
+            // If peer hasn't been updated with Session 21 CRC Fix, they will send
+            // CRC calculated on plaintext but payload encrypted → BAD_CRC here.
+            // We keep this code for backward compatibility.
 
-            // Get peer DEK based on source sysid
-            const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
+            const bool is_plaintext_msg = (msg.msgid == 0 || msg.msgid == 12000 ||
+                                           msg.msgid == 12001 || msg.msgid == 12002);
 
-            if (peer_dek != nullptr && msg.len > 0) {
-                // Nonce déterministe basé sur les champs du message
-                // Utilise seq + sysid + compid + msgid pour synchronisation
-                uint8_t nonce[12];
-                nonce[0] = msg.seq;
-                nonce[1] = msg.sysid;
-                nonce[2] = msg.compid;
-                nonce[3] = (msg.msgid >> 0) & 0xFF;
-                nonce[4] = (msg.msgid >> 8) & 0xFF;
-                nonce[5] = (msg.msgid >> 16) & 0xFF;
-                nonce[6] = chan;  // Channel ID
-                nonce[7] = 0x00;  // Direction: same as TX
-                nonce[8] = 0x00;
-                nonce[9] = 0x00;
-                nonce[10] = 0x00;
-                nonce[11] = 0x00;
+            if (!is_plaintext_msg) {
+                KeyExchangeProtocol* kep = KeyExchangeProtocol::get_singleton();
+                const uint8_t* peer_dek = (kep != nullptr) ? kep->get_peer_dek(msg.sysid, 0) : nullptr;
 
-                // Décrypter le payload in-place
-                uint8_t decrypted[MAVLINK_MAX_PAYLOAD_LEN];
-                ChaCha20XOR((uint8_t*)peer_dek, 0, nonce, (uint8_t*)msg.payload64, decrypted, msg.len);
-                memcpy((void*)msg.payload64, decrypted, msg.len);
+                if (peer_dek != nullptr && msg.len > 0) {
+                    uint8_t nonce[12];
+                    nonce[0] = msg.seq;
+                    nonce[1] = msg.sysid;
+                    nonce[2] = msg.compid;
+                    nonce[3] = (msg.msgid >> 0) & 0xFF;
+                    nonce[4] = (msg.msgid >> 8) & 0xFF;
+                    nonce[5] = (msg.msgid >> 16) & 0xFF;
+                    nonce[6] = chan;
+                    nonce[7] = 0x00;
+                    nonce[8] = 0x00;
+                    nonce[9] = 0x00;
+                    nonce[10] = 0x00;
+                    nonce[11] = 0x00;
 
-                // Debug périodique
-                static uint32_t rx_decrypt_count = 0;
-                if (++rx_decrypt_count % 50 == 1) {
-                    hal.console->printf("DDE-RX: Decrypted msg %u from sysid=%u (%u bytes)\n",
-                           msg.msgid, msg.sysid, msg.len);
-                }
+                    uint8_t decrypted[MAVLINK_MAX_PAYLOAD_LEN];
+                    ChaCha20XOR((uint8_t*)peer_dek, 0, nonce, (uint8_t*)msg.payload64, decrypted, msg.len);
+                    memcpy((void*)msg.payload64, decrypted, msg.len);
 
-                // Process the decrypted message
-                hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
-                packetReceived(status, msg);
-                parsed_packet = true;
-                gcs_alternative_active[chan] = false;
-                alternative.last_mavlink_ms = now_ms;
-                hal.util->persistent_data.last_mavlink_msgid = 0;
-            } else {
-                // No peer DEK - cannot decrypt
-                static uint8_t no_dek_warn_count = 0;
-                if (no_dek_warn_count < 5) {
-                    hal.console->printf("DDE-RX: No DEK for sysid=%u, cannot decrypt\n", msg.sysid);
-                    no_dek_warn_count++;
+                    static uint32_t legacy_decrypt_count = 0;
+                    if (++legacy_decrypt_count % 50 == 1) {
+                        hal.console->printf("DDE-RX: [LEGACY BAD_CRC] Decrypted msg %u from sysid=%u (%u bytes)\n",
+                               msg.msgid, msg.sysid, msg.len);
+                    }
+
+                    hal.util->persistent_data.last_mavlink_msgid = msg.msgid;
+                    packetReceived(status, msg);
+                    parsed_packet = true;
+                    gcs_alternative_active[chan] = false;
+                    alternative.last_mavlink_ms = now_ms;
+                    hal.util->persistent_data.last_mavlink_msgid = 0;
+                } else {
+                    static uint8_t no_dek_warn_count = 0;
+                    if (no_dek_warn_count < 5) {
+                        hal.console->printf("DDE-RX: No DEK for sysid=%u, cannot decrypt (BAD_CRC)\n", msg.sysid);
+                        no_dek_warn_count++;
+                    }
                 }
             }
         }

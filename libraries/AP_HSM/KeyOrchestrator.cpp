@@ -20,6 +20,18 @@
 
 extern const AP_HAL::HAL& hal;
 
+// Session 21: Disable verbose console output in SITL to avoid MAVLink stream corruption
+// In SITL, hal.console writes to the MAVLink TCP port (5760)
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+  #if AP_HSM_MOCK_ENABLED
+    #define KO_DEBUG(fmt, ...) do { /* disabled in SITL Mock */ } while(0)
+  #else
+    #define KO_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+  #endif
+#else
+  #define KO_DEBUG(fmt, ...) hal.console->printf(fmt, ##__VA_ARGS__)
+#endif
+
 // Singleton instance
 KeyOrchestrator* KeyOrchestrator::_singleton = nullptr;
 
@@ -76,14 +88,14 @@ KeyOrchestrator& KeyOrchestrator::get_singleton()
 bool KeyOrchestrator::init(AP_HSM* hsm)
 {
     if (hsm == nullptr) {
-        hal.console->printf("KeyOrch: ERREUR - AP_HSM null\n");
+        KO_DEBUG("KeyOrch: ERREUR - AP_HSM null\n");
         return false;
     }
 
     _hsm = hsm;
     _initialized = true;
 
-    hal.console->printf("KeyOrch: Initialisé avec AP_HSM\n");
+    KO_DEBUG("KeyOrch: Initialisé avec AP_HSM\n");
     return true;
 }
 
@@ -93,62 +105,62 @@ bool KeyOrchestrator::init(AP_HSM* hsm)
 
 bool KeyOrchestrator::init_mission_keys()
 {
-    hal.console->printf("KeyOrch: init (uECC disabled for Pixhawk)\n");
+    KO_DEBUG("KeyOrch: init (uECC disabled for Pixhawk)\n");
 
     if (!_initialized) {
-        hal.console->printf("KeyOrch: Not init\n");
+        KO_DEBUG("KeyOrch: Not init\n");
         return false;
     }
 
     // Step 1: Generate Master Key with RNG
-    hal.console->printf("KeyOrch: [1] RNG...\n");
+    KO_DEBUG("KeyOrch: [1] RNG...\n");
     if (!generate_master_key()) {
-        hal.console->printf("KeyOrch: RNG FAIL\n");
+        KO_DEBUG("KeyOrch: RNG FAIL\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [1] MK=%02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: [1] MK=%02X%02X%02X%02X\n",
            _master_key[0], _master_key[1], _master_key[2], _master_key[3]);
 
     // Step 2: Derive WK_private with HKDF
-    hal.console->printf("KeyOrch: [2] HKDF...\n");
+    KO_DEBUG("KeyOrch: [2] HKDF...\n");
     if (!derive_wrapper_key()) {
-        hal.console->printf("KeyOrch: HKDF FAIL\n");
+        KO_DEBUG("KeyOrch: HKDF FAIL\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [2] WK_priv=%02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: [2] WK_priv=%02X%02X%02X%02X\n",
            _wk_private[0], _wk_private[1], _wk_private[2], _wk_private[3]);
 
     // Step 3: Compute WK_public from WK_private using uECC
-    hal.console->printf("KeyOrch: [3] Computing WK_pub with uECC...\n");
+    KO_DEBUG("KeyOrch: [3] Computing WK_pub with uECC...\n");
     uECC_Curve curve = uECC_secp256r1();
     if (uECC_compute_public_key(_wk_private, _wk_public, curve) != 1) {
-        hal.console->printf("KeyOrch: uECC_compute_public_key FAILED\n");
+        KO_DEBUG("KeyOrch: uECC_compute_public_key FAILED\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [3] WK_pub=%02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: [3] WK_pub=%02X%02X%02X%02X\n",
            _wk_public[0], _wk_public[1], _wk_public[2], _wk_public[3]);
 
     // Step 4: Generate DEK
-    hal.console->printf("KeyOrch: [4] DEK...\n");
+    KO_DEBUG("KeyOrch: [4] DEK...\n");
     if (!generate_dek()) {
-        hal.console->printf("KeyOrch: DEK FAIL\n");
+        KO_DEBUG("KeyOrch: DEK FAIL\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [4] DEK=%02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: [4] DEK=%02X%02X%02X%02X\n",
            _my_dek[0], _my_dek[1], _my_dek[2], _my_dek[3]);
 
-    hal.console->printf("KeyOrch: ✓ Keys initialized (proto mode)\n");
+    KO_DEBUG("KeyOrch: ✓ Keys initialized (proto mode)\n");
     return true;
 }
 
 bool KeyOrchestrator::restore_mission_keys()
 {
-    hal.console->printf("KeyOrch: ═══════════════════════════════════════════\n");
-    hal.console->printf("KeyOrch: RESTAURATION CLÉS DEPUIS HSM\n");
-    hal.console->printf("KeyOrch: ═══════════════════════════════════════════\n");
+    KO_DEBUG("KeyOrch: ═══════════════════════════════════════════\n");
+    KO_DEBUG("KeyOrch: RESTAURATION CLÉS DEPUIS HSM\n");
+    KO_DEBUG("KeyOrch: ═══════════════════════════════════════════\n");
 
     if (!_initialized) {
-        hal.console->printf("KeyOrch: ERREUR - Non initialisé\n");
+        KO_DEBUG("KeyOrch: ERREUR - Non initialisé\n");
         return false;
     }
 
@@ -157,48 +169,48 @@ bool KeyOrchestrator::restore_mission_keys()
     // ─────────────────────────────────────────────────────────────────────
     // ÉTAPE 1: Charger Master Key
     // ─────────────────────────────────────────────────────────────────────
-    hal.console->printf("KeyOrch: [1/4] Chargement Master Key...\n");
+    KO_DEBUG("KeyOrch: [1/4] Chargement Master Key...\n");
     if (!load_mk_from_hsm()) {
-        hal.console->printf("KeyOrch: Pas de MK valide - nouvelle mission requise\n");
+        KO_DEBUG("KeyOrch: Pas de MK valide - nouvelle mission requise\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [1/4] ✓ Master Key chargée\n");
+    KO_DEBUG("KeyOrch: [1/4] ✓ Master Key chargée\n");
 
     // ─────────────────────────────────────────────────────────────────────
     // ÉTAPE 2: Charger et unwrap Wrapper Key
     // ─────────────────────────────────────────────────────────────────────
-    hal.console->printf("KeyOrch: [2/4] Chargement Wrapper Key...\n");
+    KO_DEBUG("KeyOrch: [2/4] Chargement Wrapper Key...\n");
     if (!load_wk_from_hsm()) {
-        hal.console->printf("KeyOrch: ERREUR - WK corrompue ou absente\n");
+        KO_DEBUG("KeyOrch: ERREUR - WK corrompue ou absente\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [2/4] ✓ Wrapper Key restaurée\n");
+    KO_DEBUG("KeyOrch: [2/4] ✓ Wrapper Key restaurée\n");
 
     // ─────────────────────────────────────────────────────────────────────
     // ÉTAPE 3: Recalculer WK_public
     // ─────────────────────────────────────────────────────────────────────
-    hal.console->printf("KeyOrch: [3/4] Recalcul WK_public...\n");
+    KO_DEBUG("KeyOrch: [3/4] Recalcul WK_public...\n");
     if (!compute_wk_public()) {
-        hal.console->printf("KeyOrch: ERREUR - Échec recalcul WK_public\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec recalcul WK_public\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [3/4] ✓ WK_public recalculée\n");
+    KO_DEBUG("KeyOrch: [3/4] ✓ WK_public recalculée\n");
 
     // ─────────────────────────────────────────────────────────────────────
     // ÉTAPE 4: Charger et unwrap DEK
     // ─────────────────────────────────────────────────────────────────────
-    hal.console->printf("KeyOrch: [4/4] Chargement DEK...\n");
+    KO_DEBUG("KeyOrch: [4/4] Chargement DEK...\n");
     if (!load_dek_from_hsm()) {
-        hal.console->printf("KeyOrch: ERREUR - DEK corrompue ou absente\n");
+        KO_DEBUG("KeyOrch: ERREUR - DEK corrompue ou absente\n");
         return false;
     }
-    hal.console->printf("KeyOrch: [4/4] ✓ DEK restaurée\n");
+    KO_DEBUG("KeyOrch: [4/4] ✓ DEK restaurée\n");
 
     _init_time_ms = AP_HAL::millis() - start_time;
 
-    hal.console->printf("KeyOrch: ═══════════════════════════════════════════\n");
-    hal.console->printf("KeyOrch: ✓ CLÉS RESTAURÉES EN %lu ms\n", (unsigned long)_init_time_ms);
-    hal.console->printf("KeyOrch: ═══════════════════════════════════════════\n");
+    KO_DEBUG("KeyOrch: ═══════════════════════════════════════════\n");
+    KO_DEBUG("KeyOrch: ✓ CLÉS RESTAURÉES EN %lu ms\n", (unsigned long)_init_time_ms);
+    KO_DEBUG("KeyOrch: ═══════════════════════════════════════════\n");
 
     print_status();
 
@@ -218,7 +230,7 @@ bool KeyOrchestrator::generate_master_key()
 {
     // Générer 32 bytes aléatoires
     if (!hal.util->get_random_vals(_master_key, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - RNG failed pour MK\n");
+        KO_DEBUG("KeyOrch: ERREUR - RNG failed pour MK\n");
         return false;
     }
 
@@ -231,7 +243,7 @@ bool KeyOrchestrator::generate_master_key()
         }
     }
     if (all_zero) {
-        hal.console->printf("KeyOrch: WARN - MK is all zeros, RNG not ready?\n");
+        KO_DEBUG("KeyOrch: WARN - MK is all zeros, RNG not ready?\n");
         // Don't fail - use fallback entropy
         // Mix with time-based entropy
         uint32_t time_ms = AP_HAL::millis();
@@ -239,11 +251,11 @@ bool KeyOrchestrator::generate_master_key()
             _master_key[i] = (uint8_t)((time_ms >> ((i % 4) * 8)) ^ (i * 17));
             time_ms = time_ms * 1103515245 + 12345;  // Simple LCG
         }
-        hal.console->printf("KeyOrch: Using time-based fallback entropy\n");
+        KO_DEBUG("KeyOrch: Using time-based fallback entropy\n");
     }
 
     _mk_loaded = true;
-    hal.console->printf("KeyOrch: MK gen OK %02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: MK gen OK %02X%02X%02X%02X\n",
            _master_key[0], _master_key[1], _master_key[2], _master_key[3]);
     return true;
 }
@@ -251,7 +263,7 @@ bool KeyOrchestrator::generate_master_key()
 bool KeyOrchestrator::store_mk_to_hsm()
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - Pas de MK à stocker\n");
+        KO_DEBUG("KeyOrch: ERREUR - Pas de MK à stocker\n");
         return false;
     }
 
@@ -275,7 +287,7 @@ bool KeyOrchestrator::load_mk_from_hsm()
     }
 
     if (all_zero || all_ff) {
-        hal.console->printf("KeyOrch: MK vide ou non initialisée\n");
+        KO_DEBUG("KeyOrch: MK vide ou non initialisée\n");
         return false;
     }
 
@@ -293,18 +305,18 @@ bool KeyOrchestrator::load_mk_from_hsm()
 bool KeyOrchestrator::derive_wrapper_key()
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - MK non chargée pour dérivation WK\n");
+        KO_DEBUG("KeyOrch: ERREUR - MK non chargée pour dérivation WK\n");
         return false;
     }
 
     // Dériver un scalar P-256 valide via HKDF
     if (!derive_p256_scalar_from_hkdf(_master_key, KEY_SIZE, _wk_private)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec dérivation P-256 scalar\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec dérivation P-256 scalar\n");
         return false;
     }
 
     _wk_loaded = true;
-    hal.console->printf("KeyOrch: WK_priv OK %02X%02X%02X%02X\n",
+    KO_DEBUG("KeyOrch: WK_priv OK %02X%02X%02X%02X\n",
            _wk_private[0], _wk_private[1], _wk_private[2], _wk_private[3]);
     return true;
 }
@@ -312,18 +324,18 @@ bool KeyOrchestrator::derive_wrapper_key()
 bool KeyOrchestrator::compute_wk_public()
 {
     if (!_wk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - WK_private non disponible\n");
+        KO_DEBUG("KeyOrch: ERREUR - WK_private non disponible\n");
         return false;
     }
 
     uECC_Curve curve = uECC_secp256r1();
     if (uECC_compute_public_key(_wk_private, _wk_public, curve) != 1) {
-        hal.console->printf("KeyOrch: ERREUR - uECC_compute_public_key failed\n");
+        KO_DEBUG("KeyOrch: ERREUR - uECC_compute_public_key failed\n");
         return false;
     }
 
     // Afficher premiers bytes de WK_public (debug)
-    hal.console->printf("KeyOrch: WK_PUB[0..7]: ");
+    KO_DEBUG("KeyOrch: WK_PUB[0..7]: ");
     for (int i = 0; i < 8; i++) {
         hal.console->printf("%02X", _wk_public[i]);
     }
@@ -335,7 +347,7 @@ bool KeyOrchestrator::compute_wk_public()
 bool KeyOrchestrator::store_wk_to_hsm()
 {
     if (!_wk_loaded || !_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - WK ou MK non disponible\n");
+        KO_DEBUG("KeyOrch: ERREUR - WK ou MK non disponible\n");
         return false;
     }
 
@@ -344,19 +356,19 @@ bool KeyOrchestrator::store_wk_to_hsm()
 
     // Wrapper WK_private avec MK
     if (!wrap_key(_wk_private, wrapped, tag)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec wrapping WK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec wrapping WK\n");
         return false;
     }
 
     // Écrire wrapped WK
     if (!write_to_hsm(HSM_OFFSET_WK, wrapped, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec écriture WK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec écriture WK\n");
         return false;
     }
 
     // Écrire tag HMAC
     if (!write_to_hsm(HSM_OFFSET_WK_TAG, tag, TAG_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec écriture WK tag\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec écriture WK tag\n");
         return false;
     }
 
@@ -369,7 +381,7 @@ bool KeyOrchestrator::store_wk_to_hsm()
 bool KeyOrchestrator::load_wk_from_hsm()
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - MK non chargée pour unwrap WK\n");
+        KO_DEBUG("KeyOrch: ERREUR - MK non chargée pour unwrap WK\n");
         return false;
     }
 
@@ -378,19 +390,19 @@ bool KeyOrchestrator::load_wk_from_hsm()
 
     // Lire wrapped WK
     if (!read_from_hsm(HSM_OFFSET_WK, wrapped, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec lecture WK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec lecture WK\n");
         return false;
     }
 
     // Lire tag HMAC
     if (!read_from_hsm(HSM_OFFSET_WK_TAG, tag, TAG_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec lecture WK tag\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec lecture WK tag\n");
         return false;
     }
 
     // Unwrap et vérifier
     if (!unwrap_key(wrapped, tag, _wk_private)) {
-        hal.console->printf("KeyOrch: ERREUR - WK corrompue (HMAC invalide)\n");
+        KO_DEBUG("KeyOrch: ERREUR - WK corrompue (HMAC invalide)\n");
         secure_memzero(wrapped, KEY_SIZE);
         secure_memzero(tag, TAG_SIZE);
         return false;
@@ -422,7 +434,7 @@ const uint8_t* KeyOrchestrator::get_wk_private() const
 bool KeyOrchestrator::generate_dek()
 {
     if (!hal.util->get_random_vals(_my_dek, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - RNG failed pour DEK\n");
+        KO_DEBUG("KeyOrch: ERREUR - RNG failed pour DEK\n");
         return false;
     }
 
@@ -433,7 +445,7 @@ bool KeyOrchestrator::generate_dek()
 bool KeyOrchestrator::store_dek_to_hsm()
 {
     if (!_dek_loaded || !_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - DEK ou MK non disponible\n");
+        KO_DEBUG("KeyOrch: ERREUR - DEK ou MK non disponible\n");
         return false;
     }
 
@@ -442,19 +454,19 @@ bool KeyOrchestrator::store_dek_to_hsm()
 
     // Wrapper DEK avec MK
     if (!wrap_key(_my_dek, wrapped, tag)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec wrapping DEK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec wrapping DEK\n");
         return false;
     }
 
     // Écrire wrapped DEK
     if (!write_to_hsm(HSM_OFFSET_DEK, wrapped, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec écriture DEK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec écriture DEK\n");
         return false;
     }
 
     // Écrire tag HMAC
     if (!write_to_hsm(HSM_OFFSET_DEK_TAG, tag, TAG_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec écriture DEK tag\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec écriture DEK tag\n");
         return false;
     }
 
@@ -467,7 +479,7 @@ bool KeyOrchestrator::store_dek_to_hsm()
 bool KeyOrchestrator::load_dek_from_hsm()
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - MK non chargée pour unwrap DEK\n");
+        KO_DEBUG("KeyOrch: ERREUR - MK non chargée pour unwrap DEK\n");
         return false;
     }
 
@@ -476,19 +488,19 @@ bool KeyOrchestrator::load_dek_from_hsm()
 
     // Lire wrapped DEK
     if (!read_from_hsm(HSM_OFFSET_DEK, wrapped, KEY_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec lecture DEK\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec lecture DEK\n");
         return false;
     }
 
     // Lire tag HMAC
     if (!read_from_hsm(HSM_OFFSET_DEK_TAG, tag, TAG_SIZE)) {
-        hal.console->printf("KeyOrch: ERREUR - Échec lecture DEK tag\n");
+        KO_DEBUG("KeyOrch: ERREUR - Échec lecture DEK tag\n");
         return false;
     }
 
     // Unwrap et vérifier
     if (!unwrap_key(wrapped, tag, _my_dek)) {
-        hal.console->printf("KeyOrch: ERREUR - DEK corrompue (HMAC invalide)\n");
+        KO_DEBUG("KeyOrch: ERREUR - DEK corrompue (HMAC invalide)\n");
         secure_memzero(wrapped, KEY_SIZE);
         secure_memzero(tag, TAG_SIZE);
         return false;
@@ -514,7 +526,7 @@ const uint8_t* KeyOrchestrator::get_my_dek() const
 bool KeyOrchestrator::wrap_key(const uint8_t* key, uint8_t* wrapped, uint8_t* tag)
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - MK non disponible pour wrapping\n");
+        KO_DEBUG("KeyOrch: ERREUR - MK non disponible pour wrapping\n");
         return false;
     }
 
@@ -532,7 +544,7 @@ bool KeyOrchestrator::wrap_key(const uint8_t* key, uint8_t* wrapped, uint8_t* ta
 bool KeyOrchestrator::unwrap_key(const uint8_t* wrapped, const uint8_t* tag, uint8_t* key)
 {
     if (!_mk_loaded) {
-        hal.console->printf("KeyOrch: ERREUR - MK non disponible pour unwrapping\n");
+        KO_DEBUG("KeyOrch: ERREUR - MK non disponible pour unwrapping\n");
         return false;
     }
 
@@ -549,7 +561,7 @@ bool KeyOrchestrator::unwrap_key(const uint8_t* wrapped, const uint8_t* tag, uin
     secure_memzero(computed_tag, TAG_SIZE);
 
     if (diff != 0) {
-        hal.console->printf("KeyOrch: ERREUR - Tag HMAC invalide\n");
+        KO_DEBUG("KeyOrch: ERREUR - Tag HMAC invalide\n");
         return false;
     }
 
@@ -583,7 +595,7 @@ bool KeyOrchestrator::store_peer_dek(const char* peer_id, const uint8_t peer_dek
         }
 
         if (idx < 0) {
-            hal.console->printf("KeyOrch: Table peers pleine (%d max)\n", MAX_PEERS);
+            KO_DEBUG("KeyOrch: Table peers pleine (%d max)\n", MAX_PEERS);
             return false;
         }
 
@@ -595,7 +607,7 @@ bool KeyOrchestrator::store_peer_dek(const char* peer_id, const uint8_t peer_dek
     memcpy(_peer_deks[idx].dek, peer_dek, KEY_SIZE);
     _peer_deks[idx].active = true;
 
-    hal.console->printf("KeyOrch: DEK peer '%s' stockée (slot %d)\n", peer_id, idx);
+    KO_DEBUG("KeyOrch: DEK peer '%s' stockée (slot %d)\n", peer_id, idx);
     return true;
 }
 
@@ -621,7 +633,7 @@ bool KeyOrchestrator::remove_peer_dek(const char* peer_id)
     _peer_deks[idx].active = false;
     _peer_count--;
 
-    hal.console->printf("KeyOrch: DEK peer supprimée\n");
+    KO_DEBUG("KeyOrch: DEK peer supprimée\n");
     return true;
 }
 
@@ -667,7 +679,7 @@ bool KeyOrchestrator::ecies_encrypt_my_dek(const uint8_t peer_wk_pub[64],
     // 1. Générer keypair éphémère
     uint8_t ephemeral_priv[32];
     if (uECC_make_key(out_ephemeral_pub, ephemeral_priv, curve) != 1) {
-        hal.console->printf("KeyOrch: ERREUR - Génération clé éphémère\n");
+        KO_DEBUG("KeyOrch: ERREUR - Génération clé éphémère\n");
         return false;
     }
 
@@ -747,7 +759,7 @@ bool KeyOrchestrator::ecies_decrypt_peer_dek(const uint8_t ephemeral_pub[64],
     }
 
     if (diff != 0) {
-        hal.console->printf("KeyOrch: ERREUR - Tag ECIES invalide\n");
+        KO_DEBUG("KeyOrch: ERREUR - Tag ECIES invalide\n");
         secure_memzero(shared_secret, sizeof(shared_secret));
         secure_memzero(encryption_key, sizeof(encryption_key));
         return false;
@@ -770,7 +782,7 @@ bool KeyOrchestrator::ecies_decrypt_peer_dek(const uint8_t ephemeral_pub[64],
 
 void KeyOrchestrator::secure_erase_all()
 {
-    hal.console->printf("KeyOrch: Effacement sécurisé de toutes les clés...\n");
+    KO_DEBUG("KeyOrch: Effacement sécurisé de toutes les clés...\n");
 
     secure_memzero(_master_key, sizeof(_master_key));
     secure_memzero(_wk_private, sizeof(_wk_private));
@@ -788,7 +800,7 @@ void KeyOrchestrator::secure_erase_all()
     _dek_loaded = false;
     _peer_count = 0;
 
-    hal.console->printf("KeyOrch: ✓ Toutes les clés effacées\n");
+    KO_DEBUG("KeyOrch: ✓ Toutes les clés effacées\n");
 }
 
 KeyOrchestrator::Stats KeyOrchestrator::get_stats() const
@@ -804,14 +816,14 @@ KeyOrchestrator::Stats KeyOrchestrator::get_stats() const
 
 void KeyOrchestrator::print_status() const
 {
-    hal.console->printf("KeyOrch: ─────────────────────────────────────────\n");
-    hal.console->printf("KeyOrch: STATUS:\n");
-    hal.console->printf("KeyOrch:   MK:  %s\n", _mk_loaded ? "LOADED" : "NOT LOADED");
-    hal.console->printf("KeyOrch:   WK:  %s\n", _wk_loaded ? "LOADED" : "NOT LOADED");
-    hal.console->printf("KeyOrch:   DEK: %s\n", _dek_loaded ? "LOADED" : "NOT LOADED");
-    hal.console->printf("KeyOrch:   Peers: %d/%d\n", _peer_count, MAX_PEERS);
-    hal.console->printf("KeyOrch:   Init time: %lu ms\n", (unsigned long)_init_time_ms);
-    hal.console->printf("KeyOrch: ─────────────────────────────────────────\n");
+    KO_DEBUG("KeyOrch: ─────────────────────────────────────────\n");
+    KO_DEBUG("KeyOrch: STATUS:\n");
+    KO_DEBUG("KeyOrch:   MK:  %s\n", _mk_loaded ? "LOADED" : "NOT LOADED");
+    KO_DEBUG("KeyOrch:   WK:  %s\n", _wk_loaded ? "LOADED" : "NOT LOADED");
+    KO_DEBUG("KeyOrch:   DEK: %s\n", _dek_loaded ? "LOADED" : "NOT LOADED");
+    KO_DEBUG("KeyOrch:   Peers: %d/%d\n", _peer_count, MAX_PEERS);
+    KO_DEBUG("KeyOrch:   Init time: %lu ms\n", (unsigned long)_init_time_ms);
+    KO_DEBUG("KeyOrch: ─────────────────────────────────────────\n");
 }
 
 void KeyOrchestrator::secure_memzero(void* ptr, size_t len)
@@ -914,12 +926,12 @@ bool KeyOrchestrator::derive_p256_scalar_from_hkdf(const uint8_t* ikm, size_t ik
     } while (!is_valid_p256_scalar(candidate) && counter < 255);
 
     if (counter >= 255) {
-        hal.console->printf("KeyOrch: ERREUR - Impossible de dériver scalar P-256 valide\n");
+        KO_DEBUG("KeyOrch: ERREUR - Impossible de dériver scalar P-256 valide\n");
         return false;
     }
 
     if (counter > 1) {
-        hal.console->printf("KeyOrch: Note - Scalar P-256 trouvé après %d itérations\n", counter);
+        KO_DEBUG("KeyOrch: Note - Scalar P-256 trouvé après %d itérations\n", counter);
     }
 
     memcpy(scalar, candidate, 32);
