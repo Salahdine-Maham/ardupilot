@@ -16,6 +16,11 @@ Date: 2026-01-25
 
 import sys
 import os
+
+# CRITICAL FIX (Session 23): Force MAVLink 2.0 protocol BEFORE importing pymavlink
+# Without this, pymavlink uses v10 dialect which cannot parse MAVLink v2 frames
+os.environ['MAVLINK20'] = '1'
+
 import time
 import struct
 import argparse
@@ -60,8 +65,12 @@ else:
 # Try to import pymavlink for connection handling
 try:
     from pymavlink import mavutil
-    # IMPORTANT: Replace mavutil's mavlink module with our HSM dialect
-    # This makes recv_match() parse HSM messages correctly
+    # CRITICAL FIX (Session 23): Set dialect to 'ardupilotmega' which contains HSM messages
+    # The default dialect 'all' does NOT have HSM messages (12000, 12001, 12002)!
+    mavutil.set_dialect('ardupilotmega')
+    print("[INFO] Set pymavlink dialect to 'ardupilotmega' (contains HSM messages)")
+
+    # Also replace mavutil's mavlink module with our HSM dialect for additional safety
     if MAVLINK_HSM_AVAILABLE:
         mavutil.mavlink = mavlink_hsm
         print("[INFO] Replaced mavutil.mavlink with HSM dialect for parsing")
@@ -77,18 +86,18 @@ def log(msg: str, level: str = "INFO"):
     print(f"[{timestamp}] [{level}] {msg}", flush=True)
 
 
-def chacha20_decrypt(key: bytes, nonce_12: bytes, ciphertext: bytes, counter: int = 0) -> bytes:
+def chacha20_xor(key: bytes, nonce_12: bytes, data: bytes, counter: int = 0) -> bytes:
     """
-    Decrypt using ChaCha20 with 12-byte nonce (RFC 7539 style)
+    ChaCha20 XOR operation (encrypt = decrypt for stream cipher)
 
     Args:
         key: 32-byte encryption key
         nonce_12: 12-byte nonce
-        ciphertext: Encrypted data
+        data: Data to encrypt/decrypt
         counter: Block counter (default 0)
 
     Returns:
-        Decrypted plaintext
+        XOR'd data (ciphertext if input was plaintext, vice versa)
     """
     if not CHACHA20_AVAILABLE:
         return None
@@ -97,8 +106,19 @@ def chacha20_decrypt(key: bytes, nonce_12: bytes, ciphertext: bytes, counter: in
     nonce_16 = counter.to_bytes(4, 'little') + nonce_12
 
     cipher = Cipher(algorithms.ChaCha20(key, nonce_16), mode=None)
-    decryptor = cipher.decryptor()
-    return decryptor.update(ciphertext)
+    encryptor = cipher.encryptor()
+    return encryptor.update(data)
+
+
+# Alias for backward compatibility
+def chacha20_decrypt(key: bytes, nonce_12: bytes, ciphertext: bytes, counter: int = 0) -> bytes:
+    """Decrypt using ChaCha20 (alias for chacha20_xor)"""
+    return chacha20_xor(key, nonce_12, ciphertext, counter)
+
+
+def chacha20_encrypt(key: bytes, nonce_12: bytes, plaintext: bytes, counter: int = 0) -> bytes:
+    """Encrypt using ChaCha20 (alias for chacha20_xor)"""
+    return chacha20_xor(key, nonce_12, plaintext, counter)
 
 
 def parse_mavlink_message(raw_bytes: bytes) -> dict:
@@ -143,6 +163,68 @@ def build_nonce_12(seq: int, sysid: int, compid: int, msgid: int, chan: int = 0,
         0x00, 0x00, 0x00, 0x00
     ])
     return nonce
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAVLink CRC Functions (Session 23: TX Encryption)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# CRC extra bytes for common MAVLink messages
+# These are computed from the message definition and are required for CRC validation
+MAVLINK_CRC_EXTRA = {
+    0: 50,       # HEARTBEAT
+    1: 124,      # SYS_STATUS
+    24: 24,      # GPS_RAW_INT
+    30: 39,      # ATTITUDE
+    33: 104,     # GLOBAL_POSITION_INT
+    35: 244,     # RC_CHANNELS_RAW
+    65: 118,     # RC_CHANNELS
+    74: 20,      # VFR_HUD
+    76: 152,     # COMMAND_LONG
+    77: 143,     # COMMAND_ACK
+    147: 154,    # BATTERY_STATUS
+    253: 83,     # STATUSTEXT
+    12000: 144,  # HSM_WK_EXCHANGE
+    12001: 14,   # HSM_DEK_EXCHANGE
+    12002: 74,   # HSM_KEY_ACK
+}
+
+
+def mavlink_crc16(data: bytes, crc_extra: int = 0) -> int:
+    """
+    Calculate MAVLink X.25 CRC
+
+    Args:
+        data: Bytes to calculate CRC over (header[1:10] + payload, NOT including STX)
+        crc_extra: CRC extra byte for the message type
+
+    Returns:
+        16-bit CRC value
+    """
+    crc = 0xFFFF
+    for byte in data:
+        tmp = byte ^ (crc & 0xFF)
+        tmp ^= (tmp << 4) & 0xFF
+        crc = (crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)
+        crc &= 0xFFFF
+
+    # Add CRC extra byte
+    if crc_extra:
+        tmp = crc_extra ^ (crc & 0xFF)
+        tmp ^= (tmp << 4) & 0xFF
+        crc = (crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)
+        crc &= 0xFFFF
+
+    return crc
+
+
+def get_crc_extra(msgid: int) -> int:
+    """Get CRC extra byte for a message ID"""
+    return MAVLINK_CRC_EXTRA.get(msgid, 0)
+
+
+# Message IDs that should NOT be encrypted (plaintext for key exchange)
+PLAINTEXT_MSGIDS = {0, 12000, 12001, 12002}
 
 
 # MAVLink message names (subset for display)
@@ -235,10 +317,122 @@ class GCSKeyExchangeClient:
             'encrypted_received': 0,
             'decrypted_ok': 0,
             'decrypted_fail': 0,
+            'tx_encrypted': 0,
+            'tx_plaintext': 0,
         }
+
+        # TX sequence counter for encryption nonce
+        self._tx_seq = 0
+
+        # Flag to enable TX encryption (set after key exchange complete)
+        self._tx_encryption_enabled = False
 
     def _log(self, msg: str, level: str = "INFO"):
         log(msg, level)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Session 23: TX Encryption for GCS → Drone
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _encrypt_and_send(self, packed_msg: bytes) -> bool:
+        """
+        Encrypt a MAVLink message and send it with CRC recalculated on ciphertext.
+
+        This mirrors the drone's TX encryption in GCS_MAVLink.cpp:
+        1. Parse the packed message to extract header and payload
+        2. If msgid NOT in PLAINTEXT_MSGIDS and encryption enabled:
+           - Encrypt payload with ChaCha20(MY_DEK, nonce)
+           - Recalculate CRC on ciphertext
+        3. Send the modified message
+
+        Args:
+            packed_msg: Complete MAVLink message from pymavlink (header + payload + crc)
+
+        Returns:
+            True if sent successfully
+        """
+        if not self.mav or len(packed_msg) < 12:
+            return False
+
+        # Parse the message
+        if packed_msg[0] != 0xFD:  # MAVLink v2 STX
+            # MAVLink v1 - send as-is (no encryption)
+            self.mav.write(packed_msg)
+            return True
+
+        payload_len = packed_msg[1]
+        seq = packed_msg[4]
+        sysid = packed_msg[5]
+        compid = packed_msg[6]
+        msgid = packed_msg[7] | (packed_msg[8] << 8) | (packed_msg[9] << 16)
+
+        header = packed_msg[0:10]
+        payload = packed_msg[10:10 + payload_len]
+
+        # Check if this message should be encrypted
+        should_encrypt = (
+            self._tx_encryption_enabled and
+            msgid not in PLAINTEXT_MSGIDS and
+            self.hsm is not None and
+            payload_len > 0
+        )
+
+        if should_encrypt:
+            my_dek = self.hsm.get_my_dek()
+            if my_dek is None:
+                should_encrypt = False
+
+        if not should_encrypt:
+            # Send plaintext
+            self.mav.write(packed_msg)
+            self._crypto_stats['tx_plaintext'] += 1
+            return True
+
+        # Encrypt the payload
+        # Build nonce: seq + sysid + compid + msgid + chan(0) + direction(0) + padding
+        nonce = build_nonce_12(seq, sysid, compid, msgid, chan=0, direction=0)
+        ciphertext = chacha20_encrypt(my_dek, nonce, payload, counter=0)
+
+        if ciphertext is None:
+            # Encryption failed - send plaintext
+            self._log(f"TX encryption failed for msgid={msgid}, sending plaintext", "WARN")
+            self.mav.write(packed_msg)
+            self._crypto_stats['tx_plaintext'] += 1
+            return True
+
+        # Recalculate CRC on ciphertext
+        # CRC is calculated over: header[1:10] (without STX) + payload + crc_extra
+        crc_data = header[1:10] + ciphertext
+        crc_extra = get_crc_extra(msgid)
+        new_crc = mavlink_crc16(crc_data, crc_extra)
+
+        # Build encrypted message
+        encrypted_msg = header + ciphertext + struct.pack('<H', new_crc)
+
+        # Check for signature (MAVLink signing)
+        original_len = 10 + payload_len + 2  # header + payload + crc
+        if len(packed_msg) > original_len:
+            # Has signature - append it (signature is on the original plaintext)
+            # Note: This may cause signature validation to fail on RX
+            # For proper support, signature should be recalculated
+            signature = packed_msg[original_len:]
+            encrypted_msg += signature
+
+        # Send encrypted message
+        self.mav.write(encrypted_msg)
+        self._crypto_stats['tx_encrypted'] += 1
+
+        # Debug log (periodic)
+        if self._crypto_stats['tx_encrypted'] % 50 == 1:
+            msg_name = MAVLINK_MSG_NAMES.get(msgid, f"MSG_{msgid}")
+            self._log(f"[TX-CRYPTO] Encrypted {msg_name} (msgid={msgid}, {payload_len} bytes)")
+
+        return True
+
+    def enable_tx_encryption(self, enable: bool = True):
+        """Enable or disable TX encryption"""
+        self._tx_encryption_enabled = enable
+        self._log(f"TX Encryption: {'ENABLED' if enable else 'DISABLED'}")
 
     def init_hsm(self, force_new: bool = False, no_hsm: bool = False) -> bool:
         """Initialize HSM and generate/load keys"""
@@ -358,6 +552,10 @@ class GCSKeyExchangeClient:
                 self._log(f"DDE initialized with peer sysid={peer_sysid}")
                 self._log(f"  MY_DEK: {my_dek[:4].hex()}...")
                 self._log(f"  PEER_DEK[{peer_sysid}]: {peer_dek[:4].hex()}...")
+
+                # Session 23: Enable TX encryption now that we have peer's DEK
+                self.enable_tx_encryption(True)
+                self._log("TX Encryption ENABLED - GCS will now encrypt outgoing messages")
             else:
                 self._log(f"WARNING: No peer DEK for sysid={peer_sysid}", "WARN")
 
@@ -472,9 +670,91 @@ class GCSKeyExchangeClient:
         except Exception as e:
             self._log(f"Failed to send heartbeat: {e}", "DEBUG")
 
+    def send_encrypted_command(self, command_id: int, param1: float = 0, param2: float = 0,
+                                param3: float = 0, param4: float = 0, param5: float = 0,
+                                param6: float = 0, param7: float = 0) -> bool:
+        """
+        Send an encrypted COMMAND_LONG message to the drone.
+
+        This is a test method to verify bidirectional encryption works.
+        The message will be encrypted with MY_DEK and CRC recalculated.
+
+        Args:
+            command_id: MAV_CMD_* command ID
+            param1-param7: Command parameters
+
+        Returns:
+            True if sent successfully
+        """
+        if not self._tx_encryption_enabled:
+            self._log("TX encryption not enabled - cannot send encrypted command", "WARN")
+            return False
+
+        if self.mav is None:
+            self._log("MAVLink not connected", "ERROR")
+            return False
+
+        try:
+            # Build COMMAND_LONG message
+            # Target: the drone (sysid=1, compid=1 typically)
+            target_sysid = self.mav.target_system
+            target_compid = self.mav.target_component
+
+            # Pack the message using pymavlink
+            msg = self.mav.mav.command_long_encode(
+                target_sysid,
+                target_compid,
+                command_id,
+                0,  # confirmation
+                param1, param2, param3, param4, param5, param6, param7
+            )
+
+            # Pack to bytes
+            packed = msg.pack(self.mav.mav)
+
+            # Send with encryption
+            success = self._encrypt_and_send(packed)
+
+            if success:
+                self._log(f"Sent encrypted COMMAND_LONG (cmd={command_id}) to sysid={target_sysid}")
+
+            return success
+
+        except Exception as e:
+            self._log(f"Failed to send encrypted command: {e}", "ERROR")
+            return False
+
+    def send_test_encrypted_messages(self, count: int = 5, interval: float = 1.0):
+        """
+        Send test encrypted messages to verify TX encryption.
+
+        Sends REQUEST_AUTOPILOT_CAPABILITIES command which should get a response.
+        """
+        if not self._tx_encryption_enabled:
+            self._log("TX encryption not enabled", "WARN")
+            return
+
+        self._log(f"Sending {count} test encrypted commands...")
+
+        for i in range(count):
+            # MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES = 520
+            success = self.send_encrypted_command(520, param1=1)
+            if success:
+                self._log(f"  Test message {i+1}/{count} sent")
+            time.sleep(interval)
+
+        self._log(f"Test complete. TX stats: encrypted={self._crypto_stats['tx_encrypted']}")
+
     def handle_message(self, msg):
         """Handle incoming MAVLink message"""
         msg_type = msg.get_type()
+
+        # Session 23: Try to decrypt ALL incoming messages (not just BAD_DATA)
+        # With CRC Fix (Session 22), encrypted messages arrive with valid CRC
+        # because CRC is now calculated on ciphertext both sides.
+        # The function filters out plaintext messages (HEARTBEAT, HSM_*) internally.
+        if msg_type != 'BAD_DATA':  # BAD_DATA handled separately below
+            self._try_decrypt_message(msg)
 
         # Debug: log all message types
         if msg_type not in ['HEARTBEAT', 'GLOBAL_POSITION_INT', 'ATTITUDE', 'SYS_STATUS',
@@ -697,13 +977,16 @@ class GCSKeyExchangeClient:
 
     def _try_decrypt_message(self, msg):
         """
-        Try to decrypt an encrypted MAVLink message (BAD_DATA due to encrypted payload)
+        Try to decrypt an encrypted MAVLink message.
+
+        Session 23 Update: Now handles BOTH valid messages and BAD_DATA.
 
         The drone encrypts only the PAYLOAD portion using ChaCha20 with a deterministic nonce.
-        This causes CRC check to fail (BAD_DATA) since CRC is computed on encrypted bytes.
+        With CRC Fix (Session 22), the CRC is recalculated on ciphertext, so messages arrive
+        with valid CRC. Without CRC Fix, they arrive as BAD_DATA.
 
         We:
-        1. Extract the raw MAVLink frame
+        1. Extract the raw MAVLink frame from msg._msgbuf
         2. Reconstruct the nonce from header fields
         3. Decrypt payload using peer's DEK
         4. Display comparison: encrypted vs decrypted
@@ -850,12 +1133,13 @@ class GCSKeyExchangeClient:
         except Exception as e:
             self._log(f"    → (parse error: {e})")
 
-    def run(self, timeout: float = 60.0, trigger_hsm_init: bool = True):
+    def run(self, timeout: float = 60.0, trigger_hsm_init: bool = True, test_tx: bool = False):
         """Run the key exchange client
 
         Args:
             timeout: Timeout in seconds (0 = infinite)
             trigger_hsm_init: If True, trigger SITL HSM init before connecting
+            test_tx: If True, send test encrypted commands after key exchange
         """
         self._log("Starting GCS KEP Client...")
 
@@ -868,6 +1152,9 @@ class GCSKeyExchangeClient:
 
         if not self.init_kep():
             return False
+
+        # Store test_tx flag for later use after key exchange
+        self._test_tx_after_exchange = test_tx
 
         # Send initial heartbeat to announce our presence
         self._send_heartbeat()
@@ -903,6 +1190,15 @@ class GCSKeyExchangeClient:
                     self._log("Exchange completed successfully!")
                     self._log("Continuing to listen for encrypted messages...")
                     self._post_exchange_logged = True
+
+                    # Send test encrypted messages if requested
+                    if hasattr(self, '_test_tx_after_exchange') and self._test_tx_after_exchange:
+                        self._log("")
+                        self._log("=" * 50)
+                        self._log("TESTING TX ENCRYPTION")
+                        self._log("=" * 50)
+                        self.send_test_encrypted_messages(count=3, interval=0.5)
+                        self._test_tx_after_exchange = False  # Only do once
 
                 # Check for timeouts
                 if self.kep:
@@ -949,9 +1245,12 @@ class GCSKeyExchangeClient:
         # Crypto stats
         self._log("")
         self._log("Crypto Statistics:")
-        self._log(f"  Encrypted received: {self._crypto_stats['encrypted_received']}")
-        self._log(f"  Decrypted OK: {self._crypto_stats['decrypted_ok']}")
-        self._log(f"  Decrypted FAIL: {self._crypto_stats['decrypted_fail']}")
+        self._log(f"  RX - Encrypted received: {self._crypto_stats['encrypted_received']}")
+        self._log(f"  RX - Decrypted OK: {self._crypto_stats['decrypted_ok']}")
+        self._log(f"  RX - Decrypted FAIL: {self._crypto_stats['decrypted_fail']}")
+        self._log(f"  TX - Encrypted sent: {self._crypto_stats['tx_encrypted']}")
+        self._log(f"  TX - Plaintext sent: {self._crypto_stats['tx_plaintext']}")
+        self._log(f"  TX Encryption: {'ENABLED' if self._tx_encryption_enabled else 'DISABLED'}")
 
     def stop(self):
         """Stop the client"""
@@ -980,6 +1279,8 @@ def main():
                        help='Skip SITL HSM init trigger (use when HSM already initialized)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Verbose logging of encrypted/decrypted payloads')
+    parser.add_argument('--test-tx', action='store_true',
+                       help='Send test encrypted commands after key exchange')
 
     args = parser.parse_args()
 
@@ -1011,7 +1312,7 @@ def main():
         return original_init_hsm(force_new=args.force_new, no_hsm=args.no_hsm)
     client.init_hsm = init_hsm_with_options
 
-    success = client.run(timeout=args.timeout, trigger_hsm_init=not args.no_trigger)
+    success = client.run(timeout=args.timeout, trigger_hsm_init=not args.no_trigger, test_tx=args.test_tx)
 
     sys.exit(0 if success else 1)
 

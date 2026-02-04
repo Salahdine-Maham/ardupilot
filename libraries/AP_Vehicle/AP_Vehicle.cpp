@@ -315,26 +315,27 @@ void AP_Vehicle::setup()
     AP_Param::setup_sketch_defaults();
 
 #if AP_SERIALMANAGER_ENABLED
-    // initialise serial port
+    // initialise serial port (TCP connection for GCS)
     serial_manager.init_console();
 #endif
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HSM INIT (SITL only) - Après TCP car HAL_SITL::run() fait déjà le bind
+    // Note: En SITL, serial(0)->begin() est appelé dans HAL_SITL::run() AVANT
+    // setup(), donc l'ordre ici n'a pas d'impact sur la connexion TCP.
+    // ═══════════════════════════════════════════════════════════════════════════
 #if AP_HSM_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_SITL
-    // Feature 1: Initialisation BLOQUANTE du LeMonolith HSM (SITL seulement)
-    // En SITL, le scheduler est single-thread donc on doit bloquer ici
-    // Sur Pixhawk, l'init se fait via hsm_update() dans le scheduler (async)
-    printf("HSM: === DÉBUT INIT HSM (SITL BLOQUANT) ===\n"); fflush(stdout);
-    hal.console->printf("HSM: === DÉBUT INIT HSM (SITL BLOQUANT) ===\n"); ;
-    AP_HAL::UARTDriver* uart = hal.serial(1); // SERIAL1 pour le HSM
-    if (uart == nullptr) {
-        hal.console->printf("HSM: Erreur - UART1 non disponible\n"); ;
+    printf("HSM: === DÉBUT INIT HSM ===\n"); fflush(stdout);
+
+    AP_HAL::UARTDriver* uart_hsm = hal.serial(1); // SERIAL1 pour le HSM
+    if (uart_hsm == nullptr) {
+        printf("HSM: Erreur - SERIAL1 non disponible!\n"); fflush(stdout);
     } else {
         AP_HSM& hsm = AP_HSM::get_singleton();
-        hsm.begin(uart);
-        hal.console->printf("HSM: Démarrage init bloquante...\n"); ;
+        hsm.begin(uart_hsm);  // Ouvre UART (Real HSM) ou skip (Mock)
 
         if (hsm.init_monolith()) {
-            hal.console->printf("HSM: ✓ Feature 1 complétée avec succès!\n"); ;
+            printf("HSM: ✓ Feature 1 complétée avec succès!\n"); fflush(stdout);
 
             // Feature 2.1: KeyOrchestrator
             printf("HSM: Feature 2.1 - Initialisation KeyOrchestrator...\n"); fflush(stdout);

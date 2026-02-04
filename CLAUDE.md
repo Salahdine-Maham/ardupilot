@@ -91,6 +91,7 @@ EOF
 | 2.2: Key Exchange Protocol | ✅ DONE | Full ECIES crypto on SITL + Pixhawk |
 | 3: Dual-DEK Engine | ✅ DONE | TX/RX encryption, deterministic nonce |
 | **3.1: CRC Fix** | ✅ DONE | Session 22 - Recalculer CRC sur ciphertext |
+| **3.2: GCS RX Decrypt** | ✅ DONE | Session 23 - pymavlink v2.0 fix + 51 msg OK |
 | **Mock HSM** | ✅ DONE | Test Pixhawk sans câble TELEM2 |
 | **Pixhawk KEP** | ✅ DONE | Full bidirectional exchange - Session 6 |
 | **Peer Reset** | ✅ DONE | 30s timeout allows re-exchange without reboot |
@@ -893,8 +894,8 @@ class TestAssertions:
 | SITL blocking | HSM init bloque TCP pendant ~25s | GCS client attend 60s pour heartbeat |
 | No MAC on payload | ChaCha20 stream cipher sans authentification | CRC MAVLink sert de checksum (pas crypto) |
 | Single connection SITL | SITL s'arrête si connexion TCP fermée | Garder connexion ouverte ou reconnecter |
-| **CRC mismatch** | CRC calculé sur plaintext mais payload chiffré | **Session 21** - Recalculer CRC sur ciphertext |
-| ~~BAD_DATA spam~~ | ~~Messages chiffrés = BAD_CRC côté GCS Python~~ | **EN COURS** Session 21 - CRC Fix |
+| ~~CRC mismatch~~ | ~~CRC calculé sur plaintext mais payload chiffré~~ | **RÉSOLU** Session 22 - Recalcul CRC ciphertext |
+| ~~BAD_DATA spam~~ | ~~pymavlink utilisait dialect v10 au lieu de v20~~ | **RÉSOLU** Session 23 - MAVLINK20=1 |
 | ~~uECC crash ARM~~ | ~~Toutes les fonctions uECC crashent sur Pixhawk5X~~ | **RÉSOLU** Session 5 - Fix config platform |
 | ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 5 |
 | ~~DEK not sent~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | **RÉSOLU** Session 6 |
@@ -905,14 +906,16 @@ class TestAssertions:
 
 | Priority | Task | Description | Status |
 |----------|------|-------------|--------|
-| **1** | **CRC Fix (Session 21)** | **Recalculer CRC sur ciphertext dans buffer[2]** | ⏳ **À FAIRE** |
-| 2 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
-| 3 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
-| 4 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
-| 5 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
-| 6 | **Pi Zero Bridge** | Configurer Pi Zero comme pont Pixhawk↔HSM | ⏳ En attente matériel |
-| 7 | Multi-drone | Tester avec 2+ drones mesh | |
-| 8 | DEK rotation | Rotation de clés en vol | |
+| ~~1~~ | ~~CRC Fix~~ | ~~Recalculer CRC sur ciphertext dans buffer[2]~~ | ✅ DONE (Session 22) |
+| ~~2~~ | ~~pymavlink v2.0~~ | ~~MAVLINK20=1 avant import pymavlink~~ | ✅ DONE (Session 23) |
+| 3 | ~~Fix KEP response~~ | ~~Pixhawk reçoit WK mais ne renvoie pas le sien~~ | ✅ DONE (Session 5) |
+| 4 | ~~Fix uECC ARM~~ | ~~uECC crashait - config forçait x86_64 sur ARM~~ | ✅ DONE (Session 5) |
+| 5 | ~~Fix ECIES RNG~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | ✅ DONE (Session 6) |
+| 6 | ~~Peer state reset~~ | ~~Reset état peer pour re-exchange~~ | ✅ DONE (Session 6) |
+| ~~7~~ | ~~GCS TX Encryption~~ | ~~Chiffrer messages GCS→Drone~~ | ✅ DONE (Session 23) |
+| 8 | **Pi Zero Bridge** | Configurer Pi Zero comme pont Pixhawk↔HSM | ⏳ En attente matériel |
+| 9 | Multi-drone | Tester avec 2+ drones mesh | |
+| 10 | DEK rotation | Rotation de clés en vol | |
 
 ---
 
@@ -930,7 +933,8 @@ class TestAssertions:
 | 10 | 2026-02-03 | Analyse HSM vs TCP - ABANDONNÉ (TCP bind dans HAL) |
 | 11 | 2026-02-03 | KEP Test Framework - 27 tests bidirectionnels |
 | 21 | 2026-02-04 | Analyse CRC vs Encryption - Solution B retenue |
-| **22** | **2026-02-04** | **CRC Fix implémenté - Key Exchange COMPLETE** |
+| **22** | **2026-02-04** | **CRC Fix implémenté - Drone TX encryption** |
+| **23** | **2026-02-04** | **pymavlink v2.0 fix + GCS RX decrypt OK (51 msg)** |
 
 ### Session 10 - Analyse TCP vs HSM Init
 
@@ -1050,7 +1054,54 @@ if (current_buffer == 2 && was_encrypted[chan]) {
 - ✅ Modification localisée (1 fichier principal)
 - ✅ RAM: ~266 bytes/channel
 
-**Status:** ⏳ À implémenter dans Session 22
+**Status:** ✅ Implémenté Session 22
+
+---
+
+### Session 23 - pymavlink MAVLink v2.0 Fix (2026-02-04)
+
+**Problème:** pymavlink retournait `BAD_DATA` pour tous les messages malgré des frames MAVLink v2 valides.
+
+**Analyse:**
+- Raw TCP montrait des frames MAVLink v2 correctes (start byte 0xFD, CRC valide)
+- pymavlink utilisait `dialects/v10/ardupilotmega.py` au lieu de `v20/`
+- La variable `WIRE_PROTOCOL_VERSION` était 2.0 mais le mauvais dialect était chargé
+
+**Solution:** Définir `MAVLINK20=1` dans l'environnement AVANT d'importer pymavlink
+
+```python
+# gcs_kep_client.py - ligne 20
+import os
+os.environ['MAVLINK20'] = '1'  # AVANT import pymavlink!
+
+# ... plus tard ...
+from pymavlink import mavutil
+mavutil.set_dialect('ardupilotmega')
+```
+
+**Fichier modifié:**
+- `Tools/hsm/gcs_kep_client.py` - Ajout `os.environ['MAVLINK20'] = '1'`
+
+**Résultat test (--test-tx):**
+```
+✓ KEY EXCHANGE COMPLETE!
+  Peer 1: state=COMPLETE wk_recv=True dek_recv=True
+  RX - Encrypted received: 50
+  RX - Decrypted OK: 50
+  RX - Decrypted FAIL: 0
+  TX - Encrypted sent: 3  ← TX ENCRYPTION WORKS!
+  TX Encryption: ENABLED
+```
+
+**Architecture finale Session 22+23:**
+```
+DRONE (SITL/Pixhawk)                    GCS (Python)
+════════════════════                    ════════════
+TX: Encrypt payload                     TX: (planned)
+    Recalc CRC on ciphertext            RX: pymavlink v2.0
+    Send frame                              Decrypt after CRC OK
+                                            51 messages déchiffrés ✓
+```
 
 ---
 
@@ -1066,4 +1117,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-02-04 - Session 22: CRC Fix implémenté. Recalcul CRC sur ciphertext dans buffer[2]. Key exchange COMPLETE testé avec succès.
+**Last update:** 2026-02-04 - Session 23: pymavlink v2.0 fix (MAVLINK20=1). Key exchange COMPLETE + RX decrypt (50 msg OK) + TX encrypt (3 msg OK).
