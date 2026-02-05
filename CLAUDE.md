@@ -33,7 +33,33 @@ python3 Tools/hsm/gcs_kep_client.py --mavlink /dev/ttyACM0 --hsm /dev/ttyUSB0 --
 #   Decrypted OK: 42+
 ```
 
-### Option 2: Test SITL avec Real HSM
+### Option 2: Test SITL avec Mock HSM (RECOMMANDÉ pour dev)
+
+```bash
+# 1. Compiler SITL (Mock HSM activé par défaut)
+./waf configure --board sitl && ./waf copter
+
+# 2. Lancer SITL (IMPORTANT: rediriger output vers fichier!)
+./build/sitl/bin/arducopter --model + > /tmp/sitl.log 2>&1 &
+sleep 5  # Attendre que port 5760 soit prêt
+
+# 3. Test GCS
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 30
+
+# 4. Test avec TX encryption
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 30 --test-tx
+
+# 5. Test verbose (voir chiffré vs déchiffré)
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 30 --verbose
+
+# Résultat attendu:
+#   KEY EXCHANGE COMPLETE!
+#   Peer 1: state=COMPLETE wk_recv=True dek_recv=True
+#   RX - Decrypted OK: 46+
+#   TX - Encrypted sent: 3 (avec --test-tx)
+```
+
+### Option 3: Test SITL avec Real HSM
 
 ```bash
 # 1. Vérifier HSM connecté
@@ -42,8 +68,8 @@ ls -la /dev/ttyUSB0
 # 2. Compiler SITL
 ./waf configure --board sitl && ./waf copter
 
-# 3. Lancer SITL avec HSM
-stdbuf -oL ./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200 &
+# 3. Lancer SITL avec HSM (IMPORTANT: rediriger output!)
+./build/sitl/bin/arducopter --model + --serial1=uart:/dev/ttyUSB0:115200 > /tmp/sitl.log 2>&1 &
 sleep 35  # Attendre init HSM (~25s)
 
 # 4. Test GCS (sans HSM local car SITL utilise le HSM)
@@ -82,7 +108,7 @@ EOF
 
 ---
 
-## Feature Status (2026-02-04)
+## Feature Status (2026-02-05)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -92,6 +118,7 @@ EOF
 | 3: Dual-DEK Engine | ✅ DONE | TX/RX encryption, deterministic nonce |
 | **3.1: CRC Fix** | ✅ DONE | Session 22 - Recalculer CRC sur ciphertext |
 | **3.2: GCS RX Decrypt** | ✅ DONE | Session 23 - pymavlink v2.0 fix + 51 msg OK |
+| **3.3: Validation Crypto** | ✅ DONE | Session 24 - Preuve chiffré vs déchiffré |
 | **Mock HSM** | ✅ DONE | Test Pixhawk sans câble TELEM2 |
 | **Pixhawk KEP** | ✅ DONE | Full bidirectional exchange - Session 6 |
 | **Peer Reset** | ✅ DONE | 30s timeout allows re-exchange without reboot |
@@ -894,11 +921,29 @@ class TestAssertions:
 | SITL blocking | HSM init bloque TCP pendant ~25s | GCS client attend 60s pour heartbeat |
 | No MAC on payload | ChaCha20 stream cipher sans authentification | CRC MAVLink sert de checksum (pas crypto) |
 | Single connection SITL | SITL s'arrête si connexion TCP fermée | Garder connexion ouverte ou reconnecter |
+| ~~EOF on TCP socket~~ | ~~SITL output pollue la connexion~~ | **RÉSOLU** Session 24 - Rediriger output vers fichier |
 | ~~CRC mismatch~~ | ~~CRC calculé sur plaintext mais payload chiffré~~ | **RÉSOLU** Session 22 - Recalcul CRC ciphertext |
 | ~~BAD_DATA spam~~ | ~~pymavlink utilisait dialect v10 au lieu de v20~~ | **RÉSOLU** Session 23 - MAVLINK20=1 |
 | ~~uECC crash ARM~~ | ~~Toutes les fonctions uECC crashent sur Pixhawk5X~~ | **RÉSOLU** Session 5 - Fix config platform |
 | ~~WK response missing~~ | ~~Pixhawk envoie KEY_ACK mais pas WK_EXCHANGE~~ | **RÉSOLU** Session 5 |
 | ~~DEK not sent~~ | ~~uECC_make_key échouait - RNG pas configuré~~ | **RÉSOLU** Session 6 |
+
+### Dépannage "EOF on TCP socket" (Session 24)
+
+**Problème:** Le GCS client affiche des milliers de "EOF on TCP socket" et échoue.
+
+**Cause:** SITL output (stdout/stderr) interfère avec la connexion quand lancé directement.
+
+**Solution:**
+```bash
+# MAUVAIS - cause EOF on TCP socket
+./build/sitl/bin/arducopter --model + &
+
+# CORRECT - rediriger output vers fichier
+./build/sitl/bin/arducopter --model + > /tmp/sitl.log 2>&1 &
+sleep 5
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 30
+```
 
 ---
 
@@ -933,8 +978,9 @@ class TestAssertions:
 | 10 | 2026-02-03 | Analyse HSM vs TCP - ABANDONNÉ (TCP bind dans HAL) |
 | 11 | 2026-02-03 | KEP Test Framework - 27 tests bidirectionnels |
 | 21 | 2026-02-04 | Analyse CRC vs Encryption - Solution B retenue |
-| **22** | **2026-02-04** | **CRC Fix implémenté - Drone TX encryption** |
-| **23** | **2026-02-04** | **pymavlink v2.0 fix + GCS RX decrypt OK (51 msg)** |
+| 22 | 2026-02-04 | CRC Fix implémenté - Drone TX encryption |
+| 23 | 2026-02-04 | pymavlink v2.0 fix + GCS RX decrypt OK (51 msg) |
+| **24** | **2026-02-05** | **Validation complète: Chiffré vs Déchiffré prouvé** |
 
 ### Session 10 - Analyse TCP vs HSM Init
 
@@ -1105,6 +1151,101 @@ TX: Encrypt payload                     TX: (planned)
 
 ---
 
+### Session 24 - Validation Complète du Chiffrement (2026-02-05)
+
+**Objectif:** Refaire les tests Session 23 et prouver que le chiffrement fonctionne en comparant payload chiffré vs déchiffré.
+
+#### Problème Rencontré: "EOF on TCP socket"
+
+**Symptôme:** Le GCS client affichait des milliers de "EOF on TCP socket" et échouait.
+
+**Cause:** Mauvaise séquence de démarrage SITL:
+```bash
+# MAUVAIS - SITL output pollue le terminal et cause des problèmes
+./build/sitl/bin/arducopter --model + &
+python3 Tools/hsm/gcs_kep_client.py --no-hsm  # ÉCHOUE!
+```
+
+**Solution:** Rediriger la sortie SITL vers un fichier:
+```bash
+# CORRECT - Séquence de test validée
+./build/sitl/bin/arducopter --model + > /tmp/sitl.log 2>&1 &
+sleep 5  # Attendre que le port 5760 soit prêt
+python3 Tools/hsm/gcs_kep_client.py --no-hsm --timeout 30  # FONCTIONNE!
+```
+
+#### Preuve du Chiffrement: Chiffré vs Déchiffré
+
+**Test avec --verbose montre la différence:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  MESSAGE: STATUSTEXT (exemple)                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  PAYLOAD CHIFFRÉ (ce que voit un attaquant):                           │
+│    HEX: 33da7564c73a21f71b71aa20ae3951dc...                            │
+│    → Bytes pseudo-aléatoires, ILLISIBLE                                │
+│                                                                         │
+│  PAYLOAD DÉCHIFFRÉ (après ChaCha20 avec DEK):                          │
+│    HEX: 06454b463320494d5531206f72696769...                            │
+│    → ASCII: "EKF3 IMU1 origin set"                                     │
+│                                                                         │
+│  ✅ DONNÉES EXPLOITABLES!                                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Comparaison pymavlink (sans déchiffrement) vs Manuel (avec DEK):**
+
+| Source | STATUSTEXT affiché |
+|--------|-------------------|
+| pymavlink (payload chiffré) | `�ud�:!�q� �9Q�k��Z�` ← GARBAGE |
+| Après déchiffrement ChaCha20 | `EKF3 IMU1 origin set` ← LISIBLE |
+
+#### Résultats des Tests Session 24
+
+**Test standard (--no-hsm):**
+```
+✅ KEY EXCHANGE COMPLETE!
+   Peer 1: state=COMPLETE wk_recv=True dek_recv=True
+   RX - Encrypted received: 46
+   RX - Decrypted OK: 46
+   RX - Decrypted FAIL: 0
+```
+
+**Test TX encryption (--test-tx):**
+```
+✅ KEY EXCHANGE COMPLETE!
+   RX - Decrypted OK: 46
+   TX - Encrypted sent: 3  ← GCS→Drone chiffré!
+   TX Encryption: ENABLED
+```
+
+**Messages déchiffrés lisibles:**
+- `"EKF3 IMU1 origin set"`
+- `"Field Elevation Set: 584m"`
+- `"EKF3 IMU0 origin set"`
+- PARAM_VALUE: `BARO1_GND...`
+
+#### Conclusion Session 24
+
+```
+╔════════════════════════════════════════════════════════════════════════╗
+║  ✅ CHIFFREMENT/DÉCHIFFREMENT VALIDÉ!                                  ║
+╠════════════════════════════════════════════════════════════════════════╣
+║                                                                        ║
+║  1. Sans DEK: payload = bytes aléatoires illisibles                   ║
+║  2. Avec DEK: payload = données exploitables                          ║
+║     • STATUSTEXT: textes lisibles                                     ║
+║     • ATTITUDE: angles roll/pitch/yaw valides                         ║
+║     • GPS: coordonnées lat/lon correctes                              ║
+║     • PARAM_VALUE: noms de paramètres ArduPilot                       ║
+║                                                                        ║
+╚════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
 ## Environment
 
 ```
@@ -1117,4 +1258,4 @@ Branch: kek-HSM
 
 ---
 
-**Last update:** 2026-02-04 - Session 23: pymavlink v2.0 fix (MAVLINK20=1). Key exchange COMPLETE + RX decrypt (50 msg OK) + TX encrypt (3 msg OK).
+**Last update:** 2026-02-05 - Session 24: Validation complète du chiffrement. Preuve chiffré vs déchiffré. Fix "EOF on TCP socket" (rediriger SITL output). 46 msg déchiffrés + 3 TX chiffrés.
